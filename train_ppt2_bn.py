@@ -105,8 +105,7 @@ def log_validation(tokenizer, text_encoder, brushnet, args, accelerator, weight_
         safety_checker=None,
         revision=args.revision,
         variant=args.variant,
-        torch_dtype=weight_dtype,
-        local_files_only=True,  # load files from local cache
+        torch_dtype=weight_dtype
     )
 
     pipe = pipe.to(accelerator.device)
@@ -585,8 +584,7 @@ def main(args):
         safety_checker=None,
         revision=args.revision,
         variant=args.variant,
-        torch_dtype=weight_dtype,
-        local_files_only=True,  # load files from local cache
+        torch_dtype=weight_dtype
     )
 
     if args.powerpaint_model_name_or_path:

@@ -1,0 +1,43 @@
+pretrained_model_name_or_path: "runwayml/stable-diffusion-v1-5"
+
+output_dir: "/content/gdrive/MyDrive/PowerPaint_KhoaLuan/output_models"
+
+resolution: 512
+
+train_batch_size: 2
+gradient_accumulation_steps: 8
+num_train_epochs: 50
+
+learning_rate: 5e-6
+
+mixed_precision: "fp16"
+
+gradient_checkpointing: true
+enable_xformers_memory_efficient_attention: true
+
+checkpointing_steps: 500
+validation_steps: 999999
+
+max_train_samples: 5000
+
+use_8bit_adam: true
+allow_tf32: true
+
+dataloader_num_workers: 2
+
+train_data:
+  datasets:
+    - dataset_class: "COCODataset"
+      data_root: "/content/coco_full_clean/train"
+      prob: 1.0
+
+task_prompt:
+  object_inpainting:
+    placeholder_tokens: "P_obj"
+    initializer_token: "object"
+    num_vectors_per_token: 1
+
+  context_aware:
+    placeholder_tokens: "P_ctxt"
+    initializer_token: "background"
+    num_vectors_per_token: 1
