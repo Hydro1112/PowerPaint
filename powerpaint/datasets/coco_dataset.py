@@ -63,15 +63,11 @@ class COCODataset(torch.utils.data.Dataset):
             np.array(mask_transformed) / 255.0
         ).unsqueeze(0).float()
 
-        task_key = (
-            "object_inpainting"
-            if random.random() < 0.5
-            else "context_aware"
-        )
+        task_key = "text_guided_object_synthesis" if random.random() < 0.5 else "object_removal"
 
         caption = (
             item["caption"]
-            if task_key == "object_inpainting"
+            if task_key == "text_guided_object_synthesis"
             else ""
         )
 

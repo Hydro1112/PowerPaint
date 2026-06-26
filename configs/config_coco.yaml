@@ -1,43 +1,33 @@
-pretrained_model_name_or_path: "runwayml/stable-diffusion-v1-5"
-
-output_dir: "/content/gdrive/MyDrive/PowerPaint_KhoaLuan/output_models"
-
+pretrained_model_name_or_path: /content/gdrive/MyDrive/Train_PowerPaint/PowerPaint/checkpoints/ppt-v2/realisticVisionV60B1_v51VAE
+base_model_name_or_path: /content/gdrive/MyDrive/Train_PowerPaint/PowerPaint/checkpoints/ppt-v2/realisticVisionV60B1_v51VAE
+powerpaint_model_name_or_path: /content/gdrive/MyDrive/Train_PowerPaint/PowerPaint/checkpoints/ppt-v2/PowerPaint_Brushnet
+output_dir: /content/gdrive/MyDrive/Train_PowerPaint/output_models
 resolution: 512
-
 train_batch_size: 2
 gradient_accumulation_steps: 8
 num_train_epochs: 5
-
 learning_rate: 5e-6
-
-mixed_precision: "fp16"
-
+mixed_precision: fp16
 gradient_checkpointing: true
 enable_xformers_memory_efficient_attention: true
-
 checkpointing_steps: 1000
 validation_steps: 999999
 checkpoints_total_limit: 3
 max_train_samples: null
-
 use_8bit_adam: true
 allow_tf32: true
-
 dataloader_num_workers: 2
-
 train_data:
   datasets:
-    - dataset_class: "COCODataset"
-      data_root: "/content/coco_full_clean/train"
-      prob: 1.0
-
+  - dataset_class: COCODataset
+    data_root: /content/coco_full_clean/train
+    prob: 1.0
 task_prompt:
-  object_inpainting:
-    placeholder_tokens: "P_obj"
-    initializer_token: "object"
-    num_vectors_per_token: 1
-
-  context_aware:
-    placeholder_tokens: "P_ctxt"
-    initializer_token: "background"
-    num_vectors_per_token: 1
+  text_guided_object_synthesis:
+    placeholder_tokens: P_obj
+    initializer_token: a
+    num_vectors_per_token: 10
+  object_removal:
+    placeholder_tokens: P_ctxt
+    initializer_token: a
+    num_vectors_per_token: 10
