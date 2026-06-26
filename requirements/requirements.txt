@@ -9,7 +9,7 @@ packaging
 Pillow
 tqdm
 huggingface-hub==0.23.4
-xformers
+xformers==0.0.31
 bitsandbytes
 imageio
 opencv-python

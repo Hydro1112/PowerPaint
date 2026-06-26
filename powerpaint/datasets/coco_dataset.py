@@ -82,13 +82,15 @@ class COCODataset(torch.utils.data.Dataset):
         input_idsA = self._tokenize(token)
         input_idsB = self._tokenize("")
 
+        tradeoff_weight = random.uniform(0.5, 1.0)
+
         return {
             "pixel_values": pixel_values,
             "mask": mask_tensor,
             "input_ids": input_ids,
             "input_idsA": input_idsA,
             "input_idsB": input_idsB,
-            "tradeoff": torch.tensor([1.0, 0.0])
+            "tradeoff": torch.tensor([tradeoff_weight, 1.0 - tradeoff_weight])
         }
 
     def _tokenize(self, text):

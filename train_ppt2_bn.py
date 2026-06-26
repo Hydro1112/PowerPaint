@@ -734,6 +734,7 @@ def main(args):
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.train_batch_size,
+        shuffle=True,
         num_workers=args.dataloader_num_workers,
     )
 
@@ -834,11 +835,17 @@ def main(args):
     )
 
     image_logs = None
+    log_interval = 100
+
+    if accelerator.is_main_process:
+        loss_log_path = os.path.join(args.output_dir, "training_log.csv")
+        loss_file = open(loss_log_path, "w")
+        loss_file.write("step,epoch,batch_accum_loss,train_loss,lr,grad_norm\n")
 
     # keep original embeddings as reference
     orig_embeds_params = accelerator.unwrap_model(text_encoder).get_input_embeddings().weight.data.clone()
 
-    for _ in range(first_epoch, args.num_train_epochs):
+    for epoch in range(first_epoch, args.num_train_epochs):
         train_loss = 0.0
         for batch in train_dataloader:
             with accelerator.accumulate(brushnet):
@@ -939,7 +946,7 @@ def main(args):
                     params_to_clip = list(brushnet.parameters()) + list(
                         accelerator.unwrap_model(text_encoder).get_input_embeddings().parameters()
                     )
-                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                    grad_norm = accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm).item()
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
@@ -958,6 +965,11 @@ def main(args):
                 progress_bar.update(1)
                 global_step += 1
                 accelerator.log({"train_loss": train_loss}, step=global_step)
+
+                if accelerator.is_main_process and global_step % log_interval == 0:
+                    loss_file.write(f"{global_step},{epoch},{loss.detach().item()},{train_loss},{lr_scheduler.get_last_lr()[0]},{grad_norm}\n")
+                    loss_file.flush()
+
                 train_loss = 0.0
 
                 if accelerator.is_main_process:
@@ -1035,6 +1047,9 @@ def main(args):
                 commit_message="End of training",
                 ignore_patterns=["step_*", "epoch_*"],
             )
+
+    if accelerator.is_main_process:
+        loss_file.close()
 
     accelerator.end_training()
 
