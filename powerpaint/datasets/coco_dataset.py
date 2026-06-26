@@ -28,23 +28,29 @@ class COCODataset(torch.utils.data.Dataset):
 
         self.task_prompt = task_prompt
 
-        self.image_transform = transforms.Compose([
-            transforms.Resize(
-                512,
-                interpolation=transforms.InterpolationMode.BILINEAR
-            ),
-            transforms.CenterCrop(512),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5])
-        ])
+        self.image_transform = train_transforms
 
-        self.mask_transform = transforms.Compose([
-            transforms.Resize(
-                512,
-                interpolation=transforms.InterpolationMode.NEAREST
-            ),
-            transforms.CenterCrop(512)
-        ])
+        mask_transforms_list = []
+        for t in train_transforms.transforms:
+            if isinstance(t, transforms.RandomResizedCrop):
+                mask_transforms_list.append(transforms.RandomResizedCrop(
+                    t.size, scale=t.scale, ratio=t.ratio,
+                    interpolation=transforms.InterpolationMode.NEAREST
+                ))
+            elif isinstance(t, transforms.RandomHorizontalFlip):
+                mask_transforms_list.append(transforms.RandomHorizontalFlip(p=t.p))
+            elif isinstance(t, (transforms.Resize, transforms.CenterCrop, transforms.RandomCrop)):
+                mask_transforms_list.append(t)
+            else:
+                break
+
+        if not mask_transforms_list:
+            mask_transforms_list = [
+                transforms.Resize(512, interpolation=transforms.InterpolationMode.NEAREST),
+                transforms.CenterCrop(512),
+            ]
+
+        self.mask_transform = transforms.Compose(mask_transforms_list)
 
     def __len__(self):
         return len(self.data)
@@ -55,8 +61,13 @@ class COCODataset(torch.utils.data.Dataset):
         image = Image.open(item["image_path"]).convert("RGB")
         mask = Image.open(item["mask_path"]).convert("L")
 
+        seed = random.randint(0, 2**32)
+        torch.manual_seed(seed)
+        random.seed(seed)
         pixel_values = self.image_transform(image)
 
+        torch.manual_seed(seed)
+        random.seed(seed)
         mask_transformed = self.mask_transform(mask)
 
         mask_tensor = torch.from_numpy(
