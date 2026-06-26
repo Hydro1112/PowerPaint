@@ -709,9 +709,9 @@ def main(args):
     # transforms used for preprocessing dataset
     train_transforms = transforms.Compose(
         [
-            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(args.resolution),
+            transforms.RandomResizedCrop(args.resolution, scale=(0.8, 1.0), ratio=(0.75, 1.33)),
             transforms.RandomHorizontalFlip(),
+            transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
             transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5]),
         ]
