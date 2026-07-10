@@ -4,6 +4,7 @@ diffusers==0.27.0
 gradio==3.41.0
 mmengine
 opencv-python
+sentencepiece
 torch
 torchvision
 transformers==4.28.0

@@ -1,6 +1,9 @@
 import argparse
 import os
 import random
+import re
+from datetime import datetime
+from io import BytesIO
 
 import cv2
 import gradio as gr
@@ -9,7 +12,7 @@ import torch
 from controlnet_aux import HEDdetector, OpenposeDetector
 from PIL import Image, ImageFilter
 from safetensors.torch import load_model
-from transformers import CLIPTextModel, DPTFeatureExtractor, DPTForDepthEstimation
+from transformers import CLIPTextModel, DPTFeatureExtractor, DPTForDepthEstimation, MarianMTModel, MarianTokenizer
 
 from diffusers import UniPCMultistepScheduler
 from diffusers.pipelines.controlnet.pipeline_controlnet import ControlNetModel
@@ -24,6 +27,174 @@ from powerpaint.utils.utils import TokenizerWrapper, add_tokens
 
 
 torch.set_grad_enabled(False)
+
+MAX_CANVAS_HISTORY = 20
+MAX_ACTIVITY_HISTORY = 25
+VIETNAMESE_CHAR_PATTERN = re.compile(
+    r"["
+    r"ăâđêôơư"
+    r"ĂÂĐÊÔƠƯ"
+    r"áàảãạấầẩẫậắằẳẵặ"
+    r"ÁÀẢÃẠẤẦẨẪẬẮẰẲẴẶ"
+    r"éèẻẽẹếềểễệ"
+    r"ÉÈẺẼẸẾỀỂỄỆ"
+    r"íìỉĩị"
+    r"ÍÌỈĨỊ"
+    r"óòỏõọốồổỗộớờởỡợ"
+    r"ÓÒỎÕỌỐỒỔỖỘỚỜỞỠỢ"
+    r"úùủũụứừửữự"
+    r"ÚÙỦŨỤỨỪỬỮỰ"
+    r"ýỳỷỹỵ"
+    r"ÝỲỶỸỴ"
+    r"]"
+)
+
+
+def clone_pil_image(image):
+    if image is None:
+        return None
+    return image.copy()
+
+
+def create_empty_mask(image):
+    width, height = image.size
+    return Image.fromarray(np.zeros((height, width, 3), dtype=np.uint8))
+
+
+def normalize_editor_value(editor_value):
+    if editor_value is None:
+        return None
+
+    if isinstance(editor_value, dict):
+        image = editor_value.get("image")
+        mask = editor_value.get("mask")
+    else:
+        image = editor_value
+        mask = None
+
+    if image is None:
+        return None
+
+    normalized_image = image.convert("RGB")
+    normalized_mask = create_empty_mask(normalized_image) if mask is None else mask.convert("RGB")
+    return {"image": clone_pil_image(normalized_image), "mask": clone_pil_image(normalized_mask)}
+
+
+def serialize_editor_value(editor_value):
+    normalized_value = normalize_editor_value(editor_value)
+    if normalized_value is None:
+        return None
+
+    payload = {}
+    for key in ("image", "mask"):
+        buffer = BytesIO()
+        normalized_value[key].save(buffer, format="PNG")
+        payload[key] = buffer.getvalue()
+    return payload
+
+
+def deserialize_editor_value(payload):
+    if payload is None:
+        return None
+
+    image = Image.open(BytesIO(payload["image"])).convert("RGB")
+    mask = Image.open(BytesIO(payload["mask"])).convert("RGB")
+    return {"image": image, "mask": mask}
+
+
+def append_activity(history_entries, message):
+    entries = list(history_entries or [])
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    entries.append({"timestamp": timestamp, "message": message})
+    return entries[-MAX_ACTIVITY_HISTORY:]
+
+
+def render_activity_history(history_entries):
+    if not history_entries:
+        return "### History\n_Chua co thao tac nao._"
+
+    lines = ["### History"]
+    for entry in reversed(history_entries):
+        lines.append(f"- `{entry['timestamp']}` {entry['message']}")
+    return "\n".join(lines)
+
+
+def render_translation_status(original_prompt, translated_prompt, original_negative_prompt, translated_negative_prompt):
+    lines = ["### Prompt Translation"]
+
+    if original_prompt:
+        lines.append(f"Prompt: `{original_prompt}`")
+        lines.append(f"English: `{translated_prompt}`")
+    else:
+        lines.append("Prompt: _trong_")
+
+    if original_negative_prompt:
+        lines.append(f"Negative: `{original_negative_prompt}`")
+        lines.append(f"English negative: `{translated_negative_prompt}`")
+    else:
+        lines.append("Negative: _trong_")
+
+    return "\n".join(lines)
+
+
+def push_canvas_state(editor_value, canvas_history, canvas_index, activity_history):
+    snapshot = serialize_editor_value(editor_value)
+    if snapshot is None:
+        return canvas_history, canvas_index, render_activity_history(activity_history), activity_history
+
+    history = list(canvas_history or [])
+    current_index = canvas_index if canvas_index is not None else -1
+    current_snapshot = history[current_index] if 0 <= current_index < len(history) else None
+
+    if current_snapshot == snapshot:
+        return history, current_index, render_activity_history(activity_history), activity_history
+
+    if current_index < len(history) - 1:
+        history = history[: current_index + 1]
+
+    history.append(snapshot)
+    if len(history) > MAX_CANVAS_HISTORY:
+        history = history[-MAX_CANVAS_HISTORY:]
+
+    new_index = len(history) - 1
+    updated_activity = append_activity(activity_history, "Da luu trang thai canvas")
+    return history, new_index, render_activity_history(updated_activity), updated_activity
+
+
+def restore_canvas(history, target_index, activity_history, action_name):
+    snapshots = list(history or [])
+    if not snapshots:
+        return None, snapshots, -1, render_activity_history(activity_history), activity_history
+
+    bounded_index = max(0, min(target_index, len(snapshots) - 1))
+    restored_value = deserialize_editor_value(snapshots[bounded_index])
+    updated_activity = append_activity(activity_history, action_name)
+    return restored_value, snapshots, bounded_index, render_activity_history(updated_activity), updated_activity
+
+
+def undo_canvas(canvas_history, canvas_index, activity_history):
+    if canvas_index is None or canvas_index <= 0:
+        return (
+            gr.update(),
+            canvas_history,
+            canvas_index if canvas_index is not None else -1,
+            render_activity_history(activity_history),
+            activity_history,
+        )
+    return restore_canvas(canvas_history, canvas_index - 1, activity_history, "Undo canvas")
+
+
+def redo_canvas(canvas_history, canvas_index, activity_history):
+    snapshots = list(canvas_history or [])
+    if canvas_index is None or canvas_index >= len(snapshots) - 1:
+        return (
+            gr.update(),
+            canvas_history,
+            canvas_index if canvas_index is not None else -1,
+            render_activity_history(activity_history),
+            activity_history,
+        )
+    return restore_canvas(canvas_history, canvas_index + 1, activity_history, "Redo canvas")
 
 
 def set_seed(seed):
@@ -85,6 +256,10 @@ class PowerPaintController:
         self.version = version
         self.checkpoint_dir = checkpoint_dir
         self.local_files_only = local_files_only
+        self.translation_model_name = "Helsinki-NLP/opus-mt-vi-en"
+        self.translation_tokenizer = None
+        self.translation_model = None
+        self.translation_error = None
 
         # initialize powerpaint pipeline
         if version == "ppt-v1":
@@ -199,6 +374,69 @@ class PowerPaintController:
             self.pipe.enable_model_cpu_offload()
             self.pipe = self.pipe.to("cuda")
 
+    def _contains_vietnamese(self, text):
+        if not text:
+            return False
+        return bool(VIETNAMESE_CHAR_PATTERN.search(text))
+
+    def _load_translation_model(self):
+        if self.translation_model is not None and self.translation_tokenizer is not None:
+            return True
+
+        if self.translation_error is not None:
+            return False
+
+        try:
+            self.translation_tokenizer = MarianTokenizer.from_pretrained(
+                self.translation_model_name,
+                local_files_only=self.local_files_only,
+            )
+            self.translation_model = MarianMTModel.from_pretrained(
+                self.translation_model_name,
+                local_files_only=self.local_files_only,
+            )
+            self.translation_model.eval()
+            return True
+        except Exception as exc:
+            self.translation_error = str(exc)
+            return False
+
+    def maybe_translate_text(self, text, enable_translation):
+        if not enable_translation or not text or not self._contains_vietnamese(text):
+            return text
+
+        if not self._load_translation_model():
+            return text
+
+        tokenized = self.translation_tokenizer(
+            [text],
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=256,
+        )
+        with torch.no_grad():
+            generated_tokens = self.translation_model.generate(**tokenized, max_length=256)
+
+        translated_text = self.translation_tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)[0].strip()
+        return translated_text or text
+
+    def translate_prompt_bundle(self, prompts, enable_translation):
+        translated_prompts = {}
+        for key, value in prompts.items():
+            translated_prompts[key] = self.maybe_translate_text(value, enable_translation)
+        return translated_prompts
+
+    def get_active_prompt_pair(self, task, prompts):
+        resolved_task = task or "text-guided"
+        if resolved_task == "shape-guided":
+            return prompts["shape_guided_prompt"], prompts["shape_guided_negative_prompt"], resolved_task
+        if resolved_task == "object-removal":
+            return prompts["removal_prompt"], prompts["removal_negative_prompt"], resolved_task
+        if resolved_task == "image-outpainting":
+            return prompts["outpaint_prompt"], prompts["outpaint_negative_prompt"], resolved_task
+        return prompts["text_guided_prompt"], prompts["text_guided_negative_prompt"], "text-guided"
+
     def get_depth_map(self, image):
         image = self.feature_extractor(images=image, return_tensors="pt").pixel_values.to("cuda")
         with torch.no_grad(), torch.autocast("cuda"):
@@ -312,7 +550,6 @@ class PowerPaintController:
             if task == "object-removal":
                 prompt = prompt + " empty scene blur"
         promptA, promptB, negative_promptA, negative_promptB = add_task(prompt, negative_prompt, task, self.version)
-        print(promptA, promptB, negative_promptA, negative_promptB)
 
         img = np.array(input_image["image"].convert("RGB"))
         W = int(np.shape(img)[0] - np.shape(img)[0] % 8)
@@ -374,17 +611,8 @@ class PowerPaintController:
                 + mask_np.astype("float") / 512.0 * red
             ).astype("uint8")
         )
-        m_img = input_image["mask"].convert("RGB").filter(ImageFilter.GaussianBlur(radius=3))
-        m_img = np.asarray(m_img) / 255.0
-        img_np = np.asarray(input_image["image"].convert("RGB")) / 255.0
-        ours_np = np.asarray(result) / 255.0
-        ours_np = ours_np * m_img + (1 - m_img) * img_np
         dict_res = [input_image["mask"].convert("RGB"), result_m]
-
-        # result_paste = Image.fromarray(np.uint8(ours_np * 255))
-        # dict_out = [input_image["image"].convert("RGB"), result_paste]
-        dict_out = [result]
-        return dict_out, dict_res
+        return [result], dict_res
 
     def predict_controlnet(
         self,
@@ -543,6 +771,95 @@ class PowerPaintController:
             )
 
 
+def run_inference_with_history(
+    controller,
+    input_image,
+    text_guided_prompt,
+    text_guided_negative_prompt,
+    shape_guided_prompt,
+    shape_guided_negative_prompt,
+    fitting_degree,
+    ddim_steps,
+    scale,
+    seed,
+    task,
+    vertical_expansion_ratio,
+    horizontal_expansion_ratio,
+    outpaint_prompt,
+    outpaint_negative_prompt,
+    removal_prompt,
+    removal_negative_prompt,
+    auto_translate_prompts,
+    activity_history,
+    enable_control=False,
+    input_control_image=None,
+    control_type="canny",
+    controlnet_conditioning_scale=None,
+):
+    normalized_input = normalize_editor_value(input_image)
+    if normalized_input is None:
+        raise gr.Error("Hay tai anh len va ve mask truoc khi chay.")
+
+    prompt_bundle = {
+        "text_guided_prompt": text_guided_prompt,
+        "text_guided_negative_prompt": text_guided_negative_prompt,
+        "shape_guided_prompt": shape_guided_prompt,
+        "shape_guided_negative_prompt": shape_guided_negative_prompt,
+        "outpaint_prompt": outpaint_prompt,
+        "outpaint_negative_prompt": outpaint_negative_prompt,
+        "removal_prompt": removal_prompt,
+        "removal_negative_prompt": removal_negative_prompt,
+    }
+    translated_bundle = controller.translate_prompt_bundle(prompt_bundle, auto_translate_prompts)
+    original_prompt, original_negative_prompt, resolved_task = controller.get_active_prompt_pair(task, prompt_bundle)
+    translated_prompt, translated_negative_prompt, _ = controller.get_active_prompt_pair(resolved_task, translated_bundle)
+
+    inference_outputs = controller.infer(
+        normalized_input,
+        translated_bundle["text_guided_prompt"],
+        translated_bundle["text_guided_negative_prompt"],
+        translated_bundle["shape_guided_prompt"],
+        translated_bundle["shape_guided_negative_prompt"],
+        fitting_degree,
+        ddim_steps,
+        scale,
+        seed,
+        resolved_task,
+        vertical_expansion_ratio,
+        horizontal_expansion_ratio,
+        translated_bundle["outpaint_prompt"],
+        translated_bundle["outpaint_negative_prompt"],
+        translated_bundle["removal_prompt"],
+        translated_bundle["removal_negative_prompt"],
+        enable_control,
+        input_control_image,
+        control_type,
+        controlnet_conditioning_scale,
+    )
+
+    activity_message = f"Run {resolved_task}: `{original_prompt or '(trong)'}` -> `{translated_prompt or '(trong)'}`"
+    if controller.translation_error and auto_translate_prompts:
+        activity_message += " (fallback sang prompt goc vi model dich khong san sang)"
+
+    updated_activity = append_activity(activity_history, activity_message)
+    translation_status = render_translation_status(
+        original_prompt,
+        translated_prompt,
+        original_negative_prompt,
+        translated_negative_prompt,
+    )
+    if controller.translation_error and auto_translate_prompts:
+        translation_status += f"\nTranslator fallback: `{controller.translation_error}`"
+
+    return (
+        inference_outputs[0],
+        inference_outputs[1],
+        translation_status,
+        render_activity_history(updated_activity),
+        updated_activity,
+    )
+
+
 if __name__ == "__main__":
     args = argparse.ArgumentParser()
     args.add_argument("--weight_dtype", type=str, default="float16")
@@ -559,8 +876,62 @@ if __name__ == "__main__":
     weight_dtype = torch.float16 if args.weight_dtype == "float16" else torch.float32
     controller = PowerPaintController(weight_dtype, args.checkpoint_dir, args.local_files_only, args.version)
 
+    def run_app_inference(
+        input_image,
+        text_guided_prompt,
+        text_guided_negative_prompt,
+        shape_guided_prompt,
+        shape_guided_negative_prompt,
+        fitting_degree,
+        ddim_steps,
+        scale,
+        seed,
+        task,
+        vertical_expansion_ratio,
+        horizontal_expansion_ratio,
+        outpaint_prompt,
+        outpaint_negative_prompt,
+        removal_prompt,
+        removal_negative_prompt,
+        auto_translate_prompts,
+        activity_history,
+        enable_control=False,
+        input_control_image=None,
+        control_type="canny",
+        controlnet_conditioning_scale=None,
+    ):
+        return run_inference_with_history(
+            controller,
+            input_image,
+            text_guided_prompt,
+            text_guided_negative_prompt,
+            shape_guided_prompt,
+            shape_guided_negative_prompt,
+            fitting_degree,
+            ddim_steps,
+            scale,
+            seed,
+            task,
+            vertical_expansion_ratio,
+            horizontal_expansion_ratio,
+            outpaint_prompt,
+            outpaint_negative_prompt,
+            removal_prompt,
+            removal_negative_prompt,
+            auto_translate_prompts,
+            activity_history,
+            enable_control,
+            input_control_image,
+            control_type,
+            controlnet_conditioning_scale,
+        )
+
     # ui
     with gr.Blocks(css="style.css") as demo:
+        canvas_history_state = gr.State([])
+        canvas_index_state = gr.State(-1)
+        activity_history_state = gr.State([])
+
         with gr.Row():
             gr.Markdown(
                 "<div align='center'><font size='18'>PowerPaint: High-Quality Versatile Image Inpainting</font></div>"  # noqa
@@ -580,6 +951,9 @@ if __name__ == "__main__":
             with gr.Column():
                 gr.Markdown("### Input image and draw mask")
                 input_image = gr.Image(source="upload", tool="sketch", type="pil")
+                with gr.Row():
+                    undo_button = gr.Button("Undo")
+                    redo_button = gr.Button("Redo")
 
                 task = gr.Radio(
                     ["text-guided", "object-removal", "shape-guided", "image-outpainting"],
@@ -589,9 +963,6 @@ if __name__ == "__main__":
 
                 # Text-guided object inpainting
                 with gr.Tab("Text-guided object inpainting") as tab_text_guided:
-                    enable_text_guided = gr.Checkbox(
-                        label="Enable text-guided object inpainting", value=True, interactive=False
-                    )
                     text_guided_prompt = gr.Textbox(label="Prompt")
                     text_guided_negative_prompt = gr.Textbox(label="negative_prompt")
                     tab_text_guided.select(fn=select_tab_text_guided, inputs=None, outputs=task)
@@ -614,13 +985,8 @@ if __name__ == "__main__":
 
                 # Object removal inpainting
                 with gr.Tab("Object removal inpainting") as tab_object_removal:
-                    enable_object_removal = gr.Checkbox(
-                        label="Enable object removal inpainting",
-                        value=True,
-                        info="The recommended configuration for the Guidance Scale is 10 or higher. \
-                        If undesired objects appear in the masked area, \
-                        you can address this by specifically increasing the Guidance Scale.",
-                        interactive=False,
+                    gr.Markdown(
+                        "The recommended configuration for Guidance Scale is 10 or higher when removing objects."
                     )
                     removal_prompt = gr.Textbox(label="Prompt")
                     removal_negative_prompt = gr.Textbox(label="negative_prompt")
@@ -628,13 +994,8 @@ if __name__ == "__main__":
 
                 # Object image outpainting
                 with gr.Tab("Image outpainting") as tab_image_outpainting:
-                    enable_object_removal = gr.Checkbox(
-                        label="Enable image outpainting",
-                        value=True,
-                        info="The recommended configuration for the Guidance Scale is 10 or higher. \
-                        If unwanted random objects appear in the extended image region, \
-                            you can enhance the cleanliness of the extension area by increasing the Guidance Scale.",
-                        interactive=False,
+                    gr.Markdown(
+                        "Use a Guidance Scale of 10 or higher if you want the extended region to stay cleaner."
                     )
                     outpaint_prompt = gr.Textbox(label="Outpainting_prompt")
                     outpaint_negative_prompt = gr.Textbox(label="Outpainting_negative_prompt")
@@ -656,9 +1017,6 @@ if __name__ == "__main__":
 
                 # Shape-guided object inpainting
                 with gr.Tab("Shape-guided object inpainting") as tab_shape_guided:
-                    enable_shape_guided = gr.Checkbox(
-                        label="Enable shape-guided object inpainting", value=True, interactive=False
-                    )
                     shape_guided_prompt = gr.Textbox(label="shape_guided_prompt")
                     shape_guided_negative_prompt = gr.Textbox(label="shape_guided_negative_prompt")
                     fitting_degree = gr.Slider(
@@ -671,6 +1029,12 @@ if __name__ == "__main__":
                 tab_shape_guided.select(fn=select_tab_shape_guided, inputs=None, outputs=task)
 
                 run_button = gr.Button(label="Run")
+                auto_translate_prompts = gr.Checkbox(
+                    label="Auto translate Vietnamese prompts to English",
+                    value=True,
+                    info="Neu prompt co tieng Viet, app se dich sang tieng Anh truoc khi suy luan.",
+                )
+                translation_status = gr.Markdown("### Prompt Translation\n_Chua co lan chay nao._")
                 with gr.Accordion("Advanced options", open=False):
                     ddim_steps = gr.Slider(label="Steps", minimum=1, maximum=50, value=45, step=1)
                     scale = gr.Slider(
@@ -693,10 +1057,27 @@ if __name__ == "__main__":
                 inpaint_result = gr.Gallery(label="Generated images", show_label=False, columns=2)
                 gr.Markdown("### Mask")
                 gallery = gr.Gallery(label="Generated masks", show_label=False, columns=2)
+                history_markdown = gr.Markdown(render_activity_history([]))
+
+        input_image.change(
+            fn=push_canvas_state,
+            inputs=[input_image, canvas_history_state, canvas_index_state, activity_history_state],
+            outputs=[canvas_history_state, canvas_index_state, history_markdown, activity_history_state],
+        )
+        undo_button.click(
+            fn=undo_canvas,
+            inputs=[canvas_history_state, canvas_index_state, activity_history_state],
+            outputs=[input_image, canvas_history_state, canvas_index_state, history_markdown, activity_history_state],
+        )
+        redo_button.click(
+            fn=redo_canvas,
+            inputs=[canvas_history_state, canvas_index_state, activity_history_state],
+            outputs=[input_image, canvas_history_state, canvas_index_state, history_markdown, activity_history_state],
+        )
 
         if args.version == "ppt-v1":
             run_button.click(
-                fn=controller.infer,
+                fn=run_app_inference,
                 inputs=[
                     input_image,
                     text_guided_prompt,
@@ -714,16 +1095,18 @@ if __name__ == "__main__":
                     outpaint_negative_prompt,
                     removal_prompt,
                     removal_negative_prompt,
+                    auto_translate_prompts,
+                    activity_history_state,
                     enable_control,
                     input_control_image,
                     control_type,
                     controlnet_conditioning_scale,
                 ],
-                outputs=[inpaint_result, gallery],
+                outputs=[inpaint_result, gallery, translation_status, history_markdown, activity_history_state],
             )
         else:
             run_button.click(
-                fn=controller.infer,
+                fn=run_app_inference,
                 inputs=[
                     input_image,
                     text_guided_prompt,
@@ -741,8 +1124,10 @@ if __name__ == "__main__":
                     outpaint_negative_prompt,
                     removal_prompt,
                     removal_negative_prompt,
+                    auto_translate_prompts,
+                    activity_history_state,
                 ],
-                outputs=[inpaint_result, gallery],
+                outputs=[inpaint_result, gallery, translation_status, history_markdown, activity_history_state],
             )
 
     demo.queue()
