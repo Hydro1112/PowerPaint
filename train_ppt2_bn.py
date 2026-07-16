@@ -738,6 +738,35 @@ def main(args):
         num_workers=args.dataloader_num_workers,
     )
 
+    # `validation_dataset` is a held-out dataset used to compute diffusion
+    # validation loss.  It is intentionally separate from `validation_data`,
+    # which is only used below for qualitative image generation.
+    validation_dataloader = None
+    if hasattr(args, "validation_dataset"):
+        validation_transforms = transforms.Compose(
+            [
+                transforms.Resize(args.resolution),
+                transforms.CenterCrop(args.resolution),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5], [0.5]),
+            ]
+        )
+        validation_config = args.validation_dataset
+        validation_class = getattr(powerpaint.datasets, validation_config.dataset_class)
+        validation_dataset = validation_class(
+            validation_transforms,
+            pipe,
+            args.task_prompt,
+            is_validation=True,
+            **validation_config,
+        )
+        validation_dataloader = torch.utils.data.DataLoader(
+            validation_dataset,
+            batch_size=getattr(args, "validation_batch_size", args.train_batch_size),
+            shuffle=False,
+            num_workers=args.dataloader_num_workers,
+        )
+
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -757,9 +786,14 @@ def main(args):
     brushnet.train()
     text_encoder.train()
     # Prepare everything with our `accelerator`.
-    brushnet, text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        brushnet, text_encoder, optimizer, train_dataloader, lr_scheduler
-    )
+    if validation_dataloader is not None:
+        brushnet, text_encoder, optimizer, train_dataloader, validation_dataloader, lr_scheduler = accelerator.prepare(
+            brushnet, text_encoder, optimizer, train_dataloader, validation_dataloader, lr_scheduler
+        )
+    else:
+        brushnet, text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            brushnet, text_encoder, optimizer, train_dataloader, lr_scheduler
+        )
 
     # Move vae, unet and text_encoder to device and cast to weight_dtype
     vae.to(accelerator.device, dtype=weight_dtype)
@@ -798,6 +832,8 @@ def main(args):
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {int(args.max_train_steps)}")
+    if validation_dataloader is not None:
+        logger.info(f"  Validation examples = {len(validation_dataset)}")
     global_step = 0
     first_epoch = 0
 
@@ -842,8 +878,78 @@ def main(args):
         loss_file = open(loss_log_path, "w")
         loss_file.write("step,epoch,batch_accum_loss,train_loss,lr,grad_norm\n")
 
+        validation_log_path = os.path.join(args.output_dir, "validation_log.csv")
+        validation_file = open(validation_log_path, "w")
+        validation_file.write("step,validation_loss\n")
+
     # keep original embeddings as reference
     orig_embeds_params = accelerator.unwrap_model(text_encoder).get_input_embeddings().weight.data.clone()
+
+    @torch.no_grad()
+    def run_validation_loss():
+        """Evaluate the held-out set with the same diffusion objective as training."""
+        brushnet.eval()
+        text_encoder.eval()
+        total_loss = torch.zeros((), device=accelerator.device)
+        total_batches = torch.zeros((), device=accelerator.device)
+
+        for batch in validation_dataloader:
+            latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample().detach()
+            latents = latents * vae.config.scaling_factor
+            mask = torch.nn.functional.interpolate(batch["mask"], size=(64, 64))
+            mask_image = batch["pixel_values"] * (batch["mask"] < 0.5)
+            mask_image = mask_image - batch["mask"]
+            mask_image_latents = vae.encode(mask_image.to(weight_dtype)).latent_dist.sample()
+            mask_image_latents = (mask_image_latents * vae.config.scaling_factor).to(weight_dtype)
+            conditioning_latents = torch.concat([mask, mask_image_latents], 1)
+
+            noise = torch.randn_like(latents)
+            timesteps = torch.randint(
+                0, noise_scheduler.config.num_train_timesteps, (latents.shape[0],), device=latents.device
+            ).long()
+            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+            encoder_hidden_states_unet = text_encoder(batch["input_ids"], return_dict=False)[0]
+            encoder_hidden_statesA = text_encoder(batch["input_idsA"], return_dict=False)[0]
+            encoder_hidden_statesB = text_encoder(batch["input_idsB"], return_dict=False)[0]
+            tradeoff = batch["tradeoff"].unsqueeze(-1)
+            encoder_hidden_states_brushnet = (
+                tradeoff[:, 0:1, :] * encoder_hidden_statesA + tradeoff[:, 1:, :] * encoder_hidden_statesB.detach()
+            )
+            down_block_res_samples, mid_block_res_sample, up_block_res_samples = brushnet(
+                noisy_latents,
+                timesteps,
+                encoder_hidden_states=encoder_hidden_states_brushnet.to(weight_dtype),
+                brushnet_cond=conditioning_latents,
+                return_dict=False,
+            )
+            model_pred = unet(
+                noisy_latents,
+                timesteps,
+                encoder_hidden_states=encoder_hidden_states_unet.detach().to(weight_dtype),
+                down_block_add_samples=[sample.to(dtype=weight_dtype) for sample in down_block_res_samples],
+                mid_block_add_sample=mid_block_res_sample.to(dtype=weight_dtype),
+                up_block_add_samples=[sample.to(dtype=weight_dtype) for sample in up_block_res_samples],
+                return_dict=False,
+            )[0]
+            target = noise if noise_scheduler.config.prediction_type == "epsilon" else noise_scheduler.get_velocity(latents, noise, timesteps)
+            if noise_scheduler.config.prediction_type not in {"epsilon", "v_prediction"}:
+                raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+            if args.snr_gamma is None:
+                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+            else:
+                snr = compute_snr(noise_scheduler, timesteps)
+                weights = torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(dim=1)[0]
+                weights = weights / (snr if noise_scheduler.config.prediction_type == "epsilon" else snr + 1)
+                loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+                loss = (loss.mean(dim=list(range(1, len(loss.shape)))) * weights).mean()
+            total_loss += loss.detach()
+            total_batches += 1
+
+        totals = accelerator.gather(torch.stack([total_loss, total_batches])).reshape(-1, 2).sum(dim=0)
+        validation_loss = (totals[0] / totals[1]).item()
+        brushnet.train()
+        text_encoder.train()
+        return validation_loss
 
     for epoch in range(first_epoch, args.num_train_epochs):
         train_loss = 0.0
@@ -972,6 +1078,14 @@ def main(args):
 
                 train_loss = 0.0
 
+                if validation_dataloader is not None and global_step % args.validation_steps == 0:
+                    validation_loss = run_validation_loss()
+                    accelerator.log({"validation_loss": validation_loss}, step=global_step)
+                    if accelerator.is_main_process:
+                        logger.info(f"Validation loss at step {global_step}: {validation_loss:.6f}")
+                        validation_file.write(f"{global_step},{validation_loss}\n")
+                        validation_file.flush()
+
                 if accelerator.is_main_process:
                     if global_step % args.checkpointing_steps == 0:
                         # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
@@ -1015,9 +1129,22 @@ def main(args):
             if global_step >= args.max_train_steps:
                 break
 
+    # Evaluate once more after the final optimizer step.  Every process must
+    # participate because run_validation_loss gathers values across processes.
+    if validation_dataloader is not None:
+        validation_loss = run_validation_loss()
+        accelerator.log({"validation_loss": validation_loss}, step=global_step)
+        if accelerator.is_main_process:
+            logger.info(f"Final validation loss: {validation_loss:.6f}")
+            validation_file.write(f"{global_step},{validation_loss}\n")
+            validation_file.flush()
+
     # Create the pipeline using using the trained modules and save it.
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
+        if validation_dataloader is not None:
+            validation_file.close()
+        loss_file.close()
         brushnet = unwrap_model(brushnet)
         brushnet.save_pretrained(args.output_dir)
 
@@ -1047,9 +1174,6 @@ def main(args):
                 commit_message="End of training",
                 ignore_patterns=["step_*", "epoch_*"],
             )
-
-    if accelerator.is_main_process:
-        loss_file.close()
 
     accelerator.end_training()
 

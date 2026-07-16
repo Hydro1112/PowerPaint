@@ -15,9 +15,11 @@ class COCODataset(torch.utils.data.Dataset):
         task_prompt,
         data_root,
         prob=1.0,
+        is_validation=False,
         **kwargs
     ):
         self.data_root = data_root
+        self.is_validation = is_validation
 
         with open(os.path.join(data_root, "metadata_run.json"), "r") as f:
             self.data = json.load(f)
@@ -74,7 +76,13 @@ class COCODataset(torch.utils.data.Dataset):
             np.array(mask_transformed) / 255.0
         ).unsqueeze(0).float()
 
-        task_key = "text_guided_object_synthesis" if random.random() < 0.5 else "object_removal"
+        # Keep validation loss reproducible: training still samples the task at
+        # random, while validation assigns each sample to one fixed task.
+        task_key = (
+            "text_guided_object_synthesis"
+            if (self.is_validation and idx % 2 == 0) or (not self.is_validation and random.random() < 0.5)
+            else "object_removal"
+        )
 
         caption = (
             item["caption"]
