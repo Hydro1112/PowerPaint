@@ -66,6 +66,16 @@ def normalize_editor_value(editor_value):
         return None
 
     if isinstance(editor_value, dict):
+        if "background" in editor_value:
+            image = editor_value.get("background") or editor_value.get("composite")
+            layers = editor_value.get("layers") or []
+            mask = None
+            if layers and layers[0] is not None:
+                layer = layers[0].convert("RGBA")
+                alpha = layer.split()[-1]
+                mask = alpha.convert("RGB")
+            editor_value = {"image": image, "mask": mask}
+
         image = editor_value.get("image")
         mask = editor_value.get("mask")
     else:
@@ -168,6 +178,12 @@ def restore_canvas(history, target_index, activity_history, action_name):
 
     bounded_index = max(0, min(target_index, len(snapshots) - 1))
     restored_value = deserialize_editor_value(snapshots[bounded_index])
+    if restored_value is not None:
+        restored_value = {
+            "background": restored_value["image"],
+            "layers": [restored_value["mask"]] if restored_value["mask"] is not None else [],
+            "composite": restored_value["image"],
+        }
     updated_activity = append_activity(activity_history, action_name)
     return restored_value, snapshots, bounded_index, render_activity_history(updated_activity), updated_activity
 
@@ -950,7 +966,7 @@ if __name__ == "__main__":
         with gr.Row():
             with gr.Column():
                 gr.Markdown("### Input image and draw mask")
-                input_image = gr.Image(source="upload", tool="sketch", type="pil")
+                input_image = gr.ImageEditor(sources=["upload"], type="pil")
                 with gr.Row():
                     undo_button = gr.Button("Undo")
                     redo_button = gr.Button("Redo")
@@ -981,7 +997,7 @@ if __name__ == "__main__":
                             value=0.5,
                         )
                         control_type = gr.Radio(["canny", "pose", "depth", "hed"], label="Control type")
-                        input_control_image = gr.Image(source="upload", type="pil")
+                        input_control_image = gr.Image(sources=["upload"], type="pil")
 
                 # Object removal inpainting
                 with gr.Tab("Object removal inpainting") as tab_object_removal:
@@ -1028,7 +1044,7 @@ if __name__ == "__main__":
                     )
                 tab_shape_guided.select(fn=select_tab_shape_guided, inputs=None, outputs=task)
 
-                run_button = gr.Button(label="Run")
+                run_button = gr.Button("Run")
                 auto_translate_prompts = gr.Checkbox(
                     label="Auto translate Vietnamese prompts to English",
                     value=True,
