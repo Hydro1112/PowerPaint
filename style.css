@@ -1,0 +1,153 @@
+:root {
+  --blue: #3d55f2;
+  --violet: #6548f5;
+  --ink: #202743;
+  --muted: #7c859d;
+  --line: #e2e6f2;
+  --surface: rgba(255, 255, 255, .9);
+}
+
+body, .gradio-container {
+  background: linear-gradient(135deg, #f9faff 0%, #f3f6ff 100%) !important;
+  color: var(--ink) !important;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
+}
+.gradio-container { max-width: 1420px !important; padding: 20px 38px 28px !important; }
+
+.app-header { display: flex; align-items: center; min-height: 60px; margin-bottom: 14px; }
+.brand-mark { display: grid; place-items: center; width: 59px; height: 59px; margin-right: 15px; border-radius: 15px; color: #fff; font-size: 1.9rem; background: linear-gradient(135deg, #4a42e9, #665bf8 58%, #2e86ee); box-shadow: 0 8px 17px rgba(65, 77, 232, .22); }
+.brand-copy h1 { margin: 0; font-size: 1.78rem; line-height: 1.05; font-weight: 760; letter-spacing: -.045em; color: #1e2640; }
+.brand-copy p { margin: 5px 0 0; color: #58627b; font-size: .98rem; }
+.app-header nav { display: flex; gap: 11px; margin-left: auto; }
+.app-header nav a { padding: 9px 18px; border: 1px solid var(--line); border-radius: 9px; color: #4050b5; text-decoration: none; font-size: .88rem; font-weight: 650; background: rgba(255,255,255,.65); }
+.app-header nav a:hover { border-color: #9ba7ff; background: #fff; }
+.notice { margin-bottom: 14px; padding: 13px 17px; border: 1px solid var(--line); border-radius: 10px; color: #8a93af; background: rgba(255,255,255,.55); font-size: .79rem; }
+.notice b { color: #6270ad; }
+
+.workspace { gap: 22px !important; align-items: flex-start !important; }
+.panel-card, .advanced-card, .task-card, .prompt-guide {
+  border: 1px solid var(--line) !important;
+  border-radius: 15px !important;
+  background: var(--surface) !important;
+  box-shadow: 0 5px 17px rgba(55, 71, 130, .05) !important;
+}
+.panel-card { padding: 16px 17px 17px !important; }
+.panel-card .block, .advanced-card .block, .task-card .block {
+  background: transparent !important;
+  border: 0 !important;
+  box-shadow: none !important;
+}
+.panel-card .prose, .panel-card .prose > *, .panel-card .markdown-text, .panel-card h3 {
+  background: transparent !important;
+  box-shadow: none !important;
+}
+.panel-card .wrap, .task-card .wrap, .advanced-card .wrap { background: transparent !important; }
+.panel-card h3, .advanced-card h3 {
+  margin: 0 0 13px !important;
+  padding: 0 !important;
+  color: #303950 !important;
+  font-size: .93rem !important;
+}
+.card-title {
+  margin: 0 0 13px;
+  color: #303950;
+  font-size: .93rem;
+  font-weight: 700;
+  line-height: 1.2;
+  background: transparent !important;
+}
+.section-title {
+  margin: 0 0 8px;
+  color: #303950;
+  font-size: .93rem;
+  font-weight: 700;
+  line-height: 1.2;
+  background: transparent !important;
+}
+.section-title-wrap, .section-title-wrap .wrap { background: transparent !important; }
+.mask-section-title { margin-top: 14px; }
+.input-card {
+  margin-bottom: 16px !important;
+  /* Gradio 3's sketch toolbar is positioned inside this component.  Let the
+     component clip its own canvas instead of letting the toolbar escape the
+     card (which makes the drawing controls appear below the image). */
+  overflow: hidden !important;
+}
+
+#input-image {
+  min-height: 216px;
+  border: 1.5px dashed #cbd5f2;
+  border-radius: 11px;
+  overflow: hidden;
+  background: linear-gradient(135deg, #fcfdff, #f4f6ff);
+}
+/* Keep Gradio's canvas, toolbar, and resize handle in one positioning context. */
+#input-image .image-container {
+  min-height: 216px;
+  overflow: hidden;
+  position: relative;
+}
+#input-image .image-container::after { content: "Kéo thả ảnh vào đây hoặc nhấn Upload"; color: #6f7993; font-size: .85rem; }
+#input-image button { border: 0 !important; border-radius: 7px !important; color: #fff !important; background: linear-gradient(100deg, #3c55ec, #5549ee) !important; }
+
+#task-tabs { border: 0 !important; background: transparent !important; }
+#task-tabs > .tab-nav { display: flex; flex-wrap: nowrap; gap: 6px; overflow: hidden; }
+#task-tabs > .tab-nav button { flex: 1 1 0; padding: 9px 8px; border: 1px solid var(--line); border-radius: 8px; color: #7e879e; font-size: .74rem; font-weight: 650; white-space: nowrap; background: rgba(255,255,255,.65); }
+#task-tabs > .tab-nav button.selected { border-color: transparent; color: #fff; background: linear-gradient(100deg, #3b58ec, #5846ef); box-shadow: 0 4px 10px rgba(71,78,234,.2); }
+#task-tabs .tabitem { margin-top: 9px; border: 1px solid var(--line); border-radius: 11px; background: rgba(255,255,255,.72); }
+.task-card { padding: 13px !important; border: 0 !important; box-shadow: none !important; background: transparent !important; }
+.task-card .prose h4 { margin: 0 0 7px !important; color: #3c4662; }
+.task-card .prose p { margin: 0; color: var(--muted); font-size: .86rem; line-height: 1.5; }
+.removal-card { min-height: 154px; display: flex; align-items: center; }
+
+label span, .gradio-container .label-wrap span { color: #45506d !important; font-size: .78rem !important; font-weight: 660 !important; }
+input, textarea { border-color: #dce1ee !important; border-radius: 8px !important; background: rgba(255,255,255,.92) !important; }
+input:focus, textarea:focus { border-color: #8390f8 !important; box-shadow: 0 0 0 2px rgba(80, 91, 239, .11) !important; }
+.gradio-container input[type=range] { accent-color: #4358ef; }
+
+#run-button { width: 100%; margin: 12px 0; border: 0 !important; border-radius: 9px !important; color: #fff !important; font-size: .94rem !important; font-weight: 720 !important; background: linear-gradient(100deg, #385bed, #5349eb) !important; box-shadow: 0 7px 14px rgba(65,78,232,.22) !important; }
+.prompt-guide { margin: 0 0 12px !important; overflow: hidden; }
+.prompt-guide > .label-wrap { color: #4150a7 !important; font-size: .86rem; font-weight: 700; }
+.prompt-guide-content { padding: 1px 5px; color: #68738d; font-size: .84rem; line-height: 1.55; }
+.prompt-guide-content p { margin: 8px 0; }
+.prompt-guide-content b { color: #3c4968; }
+.task-card .html-container, .task-card .html-container > div { background: transparent !important; }
+.inline-prompt-guide {
+  margin: 4px 0 10px;
+  padding: 8px 10px;
+  border: 1px solid #dfe5ff;
+  border-radius: 7px;
+  color: #71809b;
+  font-size: .72rem;
+  line-height: 1.45;
+  background: linear-gradient(100deg, #f3f5ff, #faf8ff) !important;
+}
+.inline-prompt-guide b { color: #53628a; }
+
+.advanced-card { padding: 15px 17px !important; }
+.advanced-card > .label-wrap {
+  padding: 0 !important;
+  color: #303950 !important;
+  background: transparent !important;
+  font-size: .93rem !important;
+  font-weight: 700 !important;
+}
+.advanced-card[open] { padding-bottom: 15px !important; }
+.advanced-card .wrap { gap: 9px; }
+.advanced-card .prose h3 { margin-bottom: 6px !important; }
+.output-card { min-height: 340px; margin-bottom: 0 !important; }
+.mask-card { min-height: 282px; }
+#result-gallery, #mask-gallery { min-height: 280px; border: 1px solid #e7eaf2; border-radius: 12px; overflow: hidden; background: linear-gradient(135deg, #fbfcff, #f5f7fc); }
+#mask-gallery { min-height: 224px; }
+#result-gallery .empty, #mask-gallery .empty { min-height: 260px; color: #a6afc1; }
+#mask-gallery .empty { min-height: 200px; }
+.tip { margin-top: 15px; padding: 13px; border-radius: 9px; color: #737f9a; text-align: center; background: #eef2ff; font-size: .83rem; }
+
+@media (max-width: 800px) {
+  .gradio-container { padding: 15px !important; }
+  .app-header { flex-wrap: wrap; }
+  .app-header nav { width: 100%; margin: 14px 0 0; overflow-x: auto; }
+  .app-header nav a { white-space: nowrap; }
+  .workspace { gap: 14px !important; }
+  .output-card, .mask-card { min-height: auto; }
+}

@@ -41,6 +41,8 @@ class TokenizerWrapper:
     ):
         # transformers = try_import("transformers")
         module_cls = transformers.CLIPTokenizer
+        self._module_cls = module_cls
+        self._module_name = module_cls.__name__
 
         assert not (from_pretrained and from_config), (
             "'from_pretrained' and 'from_config' should not be passed " "at the same time."
@@ -59,26 +61,27 @@ class TokenizerWrapper:
         if from_pretrained:
             self.wrapped = module_cls.from_pretrained(from_pretrained, *args, **kwargs)
         else:
-            self.wrapper = module_cls(*args, **kwargs)
+            self.wrapped = module_cls(*args, **kwargs)
 
         self._from_pretrained = from_pretrained
         self.token_map = {}
 
     def __getattr__(self, name: str) -> Any:
-        if name == "wrapped":
-            return super().__getattr__("wrapped")
+        try:
+            wrapped = object.__getattribute__(self, "wrapped")
+        except AttributeError as exc:
+            raise AttributeError(
+                f"'{self.__class__.__name__}' has not initialized its wrapped tokenizer yet."
+            ) from exc
 
         try:
-            return getattr(self.wrapped, name)
-        except AttributeError:
-            try:
-                return super().__getattr__(name)
-            except AttributeError:
-                raise AttributeError(
-                    "'name' cannot be found in both "
-                    f"'{self.__class__.__name__}' and "
-                    f"'{self.__class__.__name__}.tokenizer'."
-                )
+            return getattr(wrapped, name)
+        except AttributeError as exc:
+            raise AttributeError(
+                f"'{name}' cannot be found in both "
+                f"'{self.__class__.__name__}' and "
+                f"'{self.__class__.__name__}.wrapped'."
+            ) from exc
 
     def try_adding_tokens(self, tokens: Union[str, List[str]], *args, **kwargs):
         """Attempt to add tokens to the tokenizer.
@@ -410,7 +413,7 @@ class EmbeddingLayerWithFixes(nn.Module):
         start = external_embedding["start"]
         end = external_embedding["end"]
         target_ids_to_replace = list(range(start, end))
-        ext_emb = external_embedding["embedding"]
+        ext_emb = external_embedding["embedding"].to(device=embedding.device, dtype=embedding.dtype)
 
         # do not need to replace
         if not (input_ids == start).any():

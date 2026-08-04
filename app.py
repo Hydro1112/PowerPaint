@@ -1,7 +1,7 @@
 import argparse
 import os
 import random
-
+from pyngrok import ngrok
 import cv2
 import gradio as gr
 import numpy as np
@@ -9,8 +9,7 @@ import torch
 from controlnet_aux import HEDdetector, OpenposeDetector
 from PIL import Image, ImageFilter
 from safetensors.torch import load_model
-from transformers import CLIPTextModel, DPTFeatureExtractor, DPTForDepthEstimation
-
+from transformers import CLIPTextModel, DPTImageProcessor, DPTForDepthEstimation
 from diffusers import UniPCMultistepScheduler
 from diffusers.pipelines.controlnet.pipeline_controlnet import ControlNetModel
 from powerpaint.models.BrushNet_CA import BrushNetModel
@@ -114,7 +113,7 @@ class PowerPaintController:
 
             # initialize controlnet-related models
             self.depth_estimator = DPTForDepthEstimation.from_pretrained("Intel/dpt-hybrid-midas").to("cuda")
-            self.feature_extractor = DPTFeatureExtractor.from_pretrained("Intel/dpt-hybrid-midas")
+            self.feature_extractor = DPTImageProcessor.from_pretrained("Intel/dpt-hybrid-midas")
             self.openpose = OpenposeDetector.from_pretrained("lllyasviel/ControlNet")
             self.hed = HEDdetector.from_pretrained("lllyasviel/ControlNet")
 
@@ -312,7 +311,6 @@ class PowerPaintController:
             if task == "object-removal":
                 prompt = prompt + " empty scene blur"
         promptA, promptB, negative_promptA, negative_promptB = add_task(prompt, negative_prompt, task, self.version)
-        print(promptA, promptB, negative_promptA, negative_promptB)
 
         img = np.array(input_image["image"].convert("RGB"))
         W = int(np.shape(img)[0] - np.shape(img)[0] % 8)
@@ -543,12 +541,103 @@ class PowerPaintController:
             )
 
 
+def run_inference_with_history(
+    controller,
+    input_image,
+    text_guided_prompt,
+    text_guided_negative_prompt,
+    shape_guided_prompt,
+    shape_guided_negative_prompt,
+    fitting_degree,
+    ddim_steps,
+    scale,
+    seed,
+    task,
+    vertical_expansion_ratio,
+    horizontal_expansion_ratio,
+    outpaint_prompt,
+    outpaint_negative_prompt,
+    removal_prompt,
+    removal_negative_prompt,
+    auto_translate_prompts,
+    activity_history,
+    enable_control=False,
+    input_control_image=None,
+    control_type="canny",
+    controlnet_conditioning_scale=None,
+):
+    normalized_input = normalize_editor_value(input_image)
+    if normalized_input is None:
+        raise gr.Error("Hay tai anh len va ve mask truoc khi chay.")
+
+    prompt_bundle = {
+        "text_guided_prompt": text_guided_prompt,
+        "text_guided_negative_prompt": text_guided_negative_prompt,
+        "shape_guided_prompt": shape_guided_prompt,
+        "shape_guided_negative_prompt": shape_guided_negative_prompt,
+        "outpaint_prompt": outpaint_prompt,
+        "outpaint_negative_prompt": outpaint_negative_prompt,
+        "removal_prompt": removal_prompt,
+        "removal_negative_prompt": removal_negative_prompt,
+    }
+    translated_bundle = controller.translate_prompt_bundle(prompt_bundle, auto_translate_prompts)
+    original_prompt, original_negative_prompt, resolved_task = controller.get_active_prompt_pair(task, prompt_bundle)
+    translated_prompt, translated_negative_prompt, _ = controller.get_active_prompt_pair(resolved_task, translated_bundle)
+
+    inference_outputs = controller.infer(
+        normalized_input,
+        translated_bundle["text_guided_prompt"],
+        translated_bundle["text_guided_negative_prompt"],
+        translated_bundle["shape_guided_prompt"],
+        translated_bundle["shape_guided_negative_prompt"],
+        fitting_degree,
+        ddim_steps,
+        scale,
+        seed,
+        resolved_task,
+        vertical_expansion_ratio,
+        horizontal_expansion_ratio,
+        translated_bundle["outpaint_prompt"],
+        translated_bundle["outpaint_negative_prompt"],
+        translated_bundle["removal_prompt"],
+        translated_bundle["removal_negative_prompt"],
+        enable_control,
+        input_control_image,
+        control_type,
+        controlnet_conditioning_scale,
+    )
+
+    activity_message = f"Run {resolved_task}: `{original_prompt or '(trong)'}` -> `{translated_prompt or '(trong)'}`"
+    if controller.translation_error and auto_translate_prompts:
+        activity_message += " (fallback sang prompt goc vi model dich khong san sang)"
+
+    updated_activity = append_activity(activity_history, activity_message)
+    translation_status = render_translation_status(
+        original_prompt,
+        translated_prompt,
+        original_negative_prompt,
+        translated_negative_prompt,
+    )
+    if controller.translation_error and auto_translate_prompts:
+        translation_status += f"\nTranslator fallback: `{controller.translation_error}`"
+
+    return (
+        inference_outputs[0],
+        inference_outputs[1],
+        translation_status,
+        render_activity_history(updated_activity),
+        updated_activity,
+    )
+
+
 if __name__ == "__main__":
     args = argparse.ArgumentParser()
     args.add_argument("--weight_dtype", type=str, default="float16")
     args.add_argument("--checkpoint_dir", type=str, default="./checkpoints/ppt-v1")
     args.add_argument("--version", type=str, default="ppt-v1")
     args.add_argument("--share", action="store_true")
+    args.add_argument("--ngrok", action="store_true")
+    args.add_argument("--ngrok_token", type=str, default="")
     args.add_argument(
         "--local_files_only", action="store_true", help="enable it to use cached files without requesting from the hub"
     )
@@ -696,7 +785,7 @@ if __name__ == "__main__":
 
         if args.version == "ppt-v1":
             run_button.click(
-                fn=controller.infer,
+                fn=run_app_inference,
                 inputs=[
                     input_image,
                     text_guided_prompt,
@@ -714,16 +803,18 @@ if __name__ == "__main__":
                     outpaint_negative_prompt,
                     removal_prompt,
                     removal_negative_prompt,
+                    auto_translate_prompts,
+                    activity_history_state,
                     enable_control,
                     input_control_image,
                     control_type,
                     controlnet_conditioning_scale,
                 ],
-                outputs=[inpaint_result, gallery],
+                outputs=[inpaint_result, gallery, translation_status, history_markdown, activity_history_state],
             )
         else:
             run_button.click(
-                fn=controller.infer,
+                fn=run_app_inference,
                 inputs=[
                     input_image,
                     text_guided_prompt,
@@ -741,9 +832,28 @@ if __name__ == "__main__":
                     outpaint_negative_prompt,
                     removal_prompt,
                     removal_negative_prompt,
+                    auto_translate_prompts,
+                    activity_history_state,
                 ],
-                outputs=[inpaint_result, gallery],
+                outputs=[inpaint_result, gallery, translation_status, history_markdown, activity_history_state],
             )
 
     demo.queue()
-    demo.launch(share=args.share, server_name="0.0.0.0", server_port=args.port)
+    if args.ngrok:
+        token = args.ngrok_token or os.getenv("NGROK_AUTHTOKEN")
+
+        if token:
+            ngrok.set_auth_token(token)
+        else:
+            raise RuntimeError(
+                "Không tìm thấy NGROK_AUTHTOKEN. "
+                "Hãy đặt biến môi trường hoặc truyền --ngrok_token."
+            )
+
+        tunnel = ngrok.connect(args.port)
+
+        print("=" * 60)
+        print("Ngrok URL:")
+        print(tunnel.public_url)
+        print("=" * 60)
+    demo.launch(share=args.share,server_name="0.0.0.0",server_port=args.port)
