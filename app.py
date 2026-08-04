@@ -3,30 +3,21 @@ import os
 import random
 from pyngrok import ngrok
 
-import cv2
 import gradio as gr
 import numpy as np
 import torch
-from controlnet_aux import HEDdetector, OpenposeDetector
 from PIL import Image, ImageFilter
 from safetensors.torch import load_model
 from transformers import (
     AutoModelForSeq2SeqLM,
     AutoTokenizer,
     CLIPTextModel,
-    DPTFeatureExtractor,
-    DPTForDepthEstimation,
 )
 
 from diffusers import UniPCMultistepScheduler
-from diffusers.pipelines.controlnet.pipeline_controlnet import ControlNetModel
 from powerpaint.models.BrushNet_CA import BrushNetModel
 from powerpaint.models.unet_2d_condition import UNet2DConditionModel
-from powerpaint.pipelines.pipeline_PowerPaint import StableDiffusionInpaintPipeline as Pipeline
 from powerpaint.pipelines.pipeline_PowerPaint_Brushnet_CA import StableDiffusionPowerPaintBrushNetPipeline
-from powerpaint.pipelines.pipeline_PowerPaint_ControlNet import (
-    StableDiffusionControlNetInpaintPipeline as controlnetPipeline,
-)
 from powerpaint.utils.utils import TokenizerWrapper, add_tokens
 
 
@@ -88,32 +79,22 @@ def set_seed(seed):
     random.seed(seed)
 
 
-def add_task(prompt, negative_prompt, control_type, version):
-    pos_prefix = neg_prefix = ""
+def add_task(prompt, negative_prompt, control_type):
     if control_type == "object-removal" or control_type == "image-outpainting":
-        if version == "ppt-v1":
-            pos_prefix = "empty scene blur " + prompt
-            neg_prefix = negative_prompt
-        promptA = pos_prefix + " P_ctxt"
-        promptB = pos_prefix + " P_ctxt"
-        negative_promptA = neg_prefix + " P_obj"
-        negative_promptB = neg_prefix + " P_obj"
+        promptA = " P_ctxt"
+        promptB = " P_ctxt"
+        negative_promptA = " P_obj"
+        negative_promptB = " P_obj"
     elif control_type == "shape-guided":
-        if version == "ppt-v1":
-            pos_prefix = prompt
-            neg_prefix = negative_prompt + ", worst quality, low quality, normal quality, bad quality, blurry "
-        promptA = pos_prefix + " P_shape"
-        promptB = pos_prefix + " P_ctxt"
-        negative_promptA = neg_prefix + "P_shape"
-        negative_promptB = neg_prefix + "P_ctxt"
+        promptA = prompt + " P_shape"
+        promptB = prompt + " P_ctxt"
+        negative_promptA = negative_prompt + "P_shape"
+        negative_promptB = negative_prompt + "P_ctxt"
     else:
-        if version == "ppt-v1":
-            pos_prefix = prompt
-            neg_prefix = negative_prompt + ", worst quality, low quality, normal quality, bad quality, blurry "
-        promptA = pos_prefix + " P_obj"
-        promptB = pos_prefix + " P_obj"
-        negative_promptA = neg_prefix + "P_obj"
-        negative_promptB = neg_prefix + "P_obj"
+        promptA = prompt + " P_obj"
+        promptB = prompt + " P_obj"
+        negative_promptA = negative_prompt + "P_obj"
+        negative_promptB = negative_prompt + "P_obj"
 
     return promptA, promptB, negative_promptA, negative_promptB
 
@@ -136,8 +117,7 @@ def select_tab_shape_guided():
 
 
 class PowerPaintController:
-    def __init__(self, weight_dtype, checkpoint_dir, local_files_only, version) -> None:
-        self.version = version
+    def __init__(self, weight_dtype, checkpoint_dir, local_files_only) -> None:
         self.checkpoint_dir = checkpoint_dir
         self.local_files_only = local_files_only
         self.weight_dtype = weight_dtype
@@ -145,118 +125,66 @@ class PowerPaintController:
         self.translation_tokenizer = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # initialize powerpaint pipeline
-        if version == "ppt-v1":
-            self.pipe = Pipeline.from_pretrained(
-                "runwayml/stable-diffusion-inpainting", torch_dtype=weight_dtype, local_files_only=local_files_only
-            )
-            self.pipe.tokenizer = TokenizerWrapper(
-                from_pretrained="runwayml/stable-diffusion-v1-5",
-                subfolder="tokenizer",
-                revision=None,
-                local_files_only=local_files_only,
-            )
+        # brushnet-based version
+        unet = UNet2DConditionModel.from_pretrained(
+            "runwayml/stable-diffusion-v1-5",
+            subfolder="unet",
+            revision=None,
+            torch_dtype=weight_dtype,
+            local_files_only=local_files_only,
+        )
+        text_encoder_brushnet = CLIPTextModel.from_pretrained(
+            "runwayml/stable-diffusion-v1-5",
+            subfolder="text_encoder",
+            revision=None,
+            torch_dtype=weight_dtype,
+            local_files_only=local_files_only,
+        )
+        brushnet = BrushNetModel.from_unet(unet)
+        base_model_path = os.path.join(checkpoint_dir, "realisticVisionV60B1_v51VAE")
+        self.pipe = StableDiffusionPowerPaintBrushNetPipeline.from_pretrained(
+            base_model_path,
+            brushnet=brushnet,
+            text_encoder_brushnet=text_encoder_brushnet,
+            torch_dtype=weight_dtype,
+            low_cpu_mem_usage=False,
+            safety_checker=None,
+        )
+        self.pipe.unet = UNet2DConditionModel.from_pretrained(
+            base_model_path,
+            subfolder="unet",
+            revision=None,
+            torch_dtype=weight_dtype,
+            local_files_only=local_files_only,
+        )
+        self.pipe.tokenizer = TokenizerWrapper(
+            from_pretrained=base_model_path,
+            subfolder="tokenizer",
+            revision=None,
+            torch_type=weight_dtype,
+            local_files_only=local_files_only,
+        )
 
-            # add learned task tokens into the tokenizer
-            add_tokens(
-                tokenizer=self.pipe.tokenizer,
-                text_encoder=self.pipe.text_encoder,
-                placeholder_tokens=["P_ctxt", "P_shape", "P_obj"],
-                initialize_tokens=["a", "a", "a"],
-                num_vectors_per_token=10,
-            )
+        add_tokens(
+            tokenizer=self.pipe.tokenizer,
+            text_encoder=self.pipe.text_encoder_brushnet,
+            placeholder_tokens=["P_ctxt", "P_shape", "P_obj"],
+            initialize_tokens=["a", "a", "a"],
+            num_vectors_per_token=10,
+        )
+        load_model(
+            self.pipe.brushnet,
+            os.path.join(checkpoint_dir, "PowerPaint_Brushnet/diffusion_pytorch_model.safetensors"),
+        )
 
-            # loading pre-trained weights
-            load_model(self.pipe.unet, os.path.join(checkpoint_dir, "unet/unet.safetensors"))
-            load_model(self.pipe.text_encoder, os.path.join(checkpoint_dir, "text_encoder/text_encoder.safetensors"))
-            self.pipe = self.pipe.to("cuda")
+        self.pipe.text_encoder_brushnet.load_state_dict(
+            torch.load(os.path.join(checkpoint_dir, "PowerPaint_Brushnet/pytorch_model.bin")), strict=False
+        )
 
-            # initialize controlnet-related models
-            self.depth_estimator = DPTForDepthEstimation.from_pretrained("Intel/dpt-hybrid-midas").to("cuda")
-            self.feature_extractor = DPTFeatureExtractor.from_pretrained("Intel/dpt-hybrid-midas")
-            self.openpose = OpenposeDetector.from_pretrained("lllyasviel/ControlNet")
-            self.hed = HEDdetector.from_pretrained("lllyasviel/ControlNet")
+        self.pipe.scheduler = UniPCMultistepScheduler.from_config(self.pipe.scheduler.config)
 
-            base_control = ControlNetModel.from_pretrained(
-                "lllyasviel/sd-controlnet-canny", torch_dtype=weight_dtype, local_files_only=local_files_only
-            )
-            self.control_pipe = controlnetPipeline(
-                self.pipe.vae,
-                self.pipe.text_encoder,
-                self.pipe.tokenizer,
-                self.pipe.unet,
-                base_control,
-                self.pipe.scheduler,
-                None,
-                None,
-                False,
-            )
-            self.control_pipe = self.control_pipe.to("cuda")
-
-            self.current_control = "canny"
-            # controlnet_conditioning_scale = 0.8
-        else:
-            # brushnet-based version
-            unet = UNet2DConditionModel.from_pretrained(
-                "runwayml/stable-diffusion-v1-5",
-                subfolder="unet",
-                revision=None,
-                torch_dtype=weight_dtype,
-                local_files_only=local_files_only,
-            )
-            text_encoder_brushnet = CLIPTextModel.from_pretrained(
-                "runwayml/stable-diffusion-v1-5",
-                subfolder="text_encoder",
-                revision=None,
-                torch_dtype=weight_dtype,
-                local_files_only=local_files_only,
-            )
-            brushnet = BrushNetModel.from_unet(unet)
-            base_model_path = os.path.join(checkpoint_dir, "realisticVisionV60B1_v51VAE")
-            self.pipe = StableDiffusionPowerPaintBrushNetPipeline.from_pretrained(
-                base_model_path,
-                brushnet=brushnet,
-                text_encoder_brushnet=text_encoder_brushnet,
-                torch_dtype=weight_dtype,
-                low_cpu_mem_usage=False,
-                safety_checker=None,
-            )
-            self.pipe.unet = UNet2DConditionModel.from_pretrained(
-                base_model_path,
-                subfolder="unet",
-                revision=None,
-                torch_dtype=weight_dtype,
-                local_files_only=local_files_only,
-            )
-            self.pipe.tokenizer = TokenizerWrapper(
-                from_pretrained=base_model_path,
-                subfolder="tokenizer",
-                revision=None,
-                torch_type=weight_dtype,
-                local_files_only=local_files_only,
-            )
-
-            # add learned task tokens into the tokenizer
-            add_tokens(
-                tokenizer=self.pipe.tokenizer,
-                text_encoder=self.pipe.text_encoder_brushnet,
-                placeholder_tokens=["P_ctxt", "P_shape", "P_obj"],
-                initialize_tokens=["a", "a", "a"],
-                num_vectors_per_token=10,
-            )
-            load_model(
-                self.pipe.brushnet,
-                os.path.join(checkpoint_dir, "PowerPaint_Brushnet/diffusion_pytorch_model.safetensors"),
-            )
-
-            self.pipe.text_encoder_brushnet.load_state_dict(
-                torch.load(os.path.join(checkpoint_dir, "PowerPaint_Brushnet/pytorch_model.bin")), strict=False
-            )
-
-            self.pipe.scheduler = UniPCMultistepScheduler.from_config(self.pipe.scheduler.config)
-
-            self.pipe.enable_model_cpu_offload()
-            self.pipe = self.pipe.to("cuda")
+        self.pipe.enable_model_cpu_offload()
+        self.pipe = self.pipe.to("cuda")
 
         self.load_translation_model()
 
@@ -312,49 +240,6 @@ class PowerPaintController:
         ):
             return self.translate_vietnamese_prompt(prompt)
         return prompt
-
-    def get_depth_map(self, image):
-        image = self.feature_extractor(images=image, return_tensors="pt").pixel_values.to("cuda")
-        with torch.no_grad(), torch.autocast("cuda"):
-            depth_map = self.depth_estimator(image).predicted_depth
-
-        depth_map = torch.nn.functional.interpolate(
-            depth_map.unsqueeze(1),
-            size=(1024, 1024),
-            mode="bicubic",
-            align_corners=False,
-        )
-        depth_min = torch.amin(depth_map, dim=[1, 2, 3], keepdim=True)
-        depth_max = torch.amax(depth_map, dim=[1, 2, 3], keepdim=True)
-        depth_map = (depth_map - depth_min) / (depth_max - depth_min)
-        image = torch.cat([depth_map] * 3, dim=1)
-
-        image = image.permute(0, 2, 3, 1).cpu().numpy()[0]
-        image = Image.fromarray((image * 255.0).clip(0, 255).astype(np.uint8))
-        return image
-
-    def load_controlnet(self, control_type):
-        if self.current_control != control_type:
-            if control_type == "canny" or control_type is None:
-                self.control_pipe.controlnet = ControlNetModel.from_pretrained(
-                    "lllyasviel/sd-controlnet-canny", torch_dtype=weight_dtype, local_files_only=self.local_files_only
-                )
-            elif control_type == "pose":
-                self.control_pipe.controlnet = ControlNetModel.from_pretrained(
-                    "lllyasviel/sd-controlnet-openpose",
-                    torch_dtype=weight_dtype,
-                    local_files_only=self.local_files_only,
-                )
-            elif control_type == "depth":
-                self.control_pipe.controlnet = ControlNetModel.from_pretrained(
-                    "lllyasviel/sd-controlnet-depth", torch_dtype=weight_dtype, local_files_only=self.local_files_only
-                )
-            else:
-                self.control_pipe.controlnet = ControlNetModel.from_pretrained(
-                    "lllyasviel/sd-controlnet-hed", torch_dtype=weight_dtype, local_files_only=self.local_files_only
-                )
-            self.control_pipe = self.control_pipe.to("cuda")
-            self.current_control = control_type
 
     def predict(
         self,
@@ -422,12 +307,11 @@ class PowerPaintController:
             input_image["image"] = Image.fromarray(expand_img)
             input_image["mask"] = Image.fromarray(expand_mask)
 
-        if self.version != "ppt-v1":
-            if task == "image-outpainting":
-                prompt = prompt + " empty scene"
-            if task == "object-removal":
-                prompt = prompt + " empty scene blur"
-        promptA, promptB, negative_promptA, negative_promptB = add_task(prompt, negative_prompt, task, self.version)
+        if task == "image-outpainting":
+            prompt = prompt + " empty scene"
+        if task == "object-removal":
+            prompt = prompt + " empty scene blur"
+        promptA, promptB, negative_promptA, negative_promptB = add_task(prompt, negative_prompt, task)
 
         img = np.array(input_image["image"].convert("RGB"))
         W = int(np.shape(img)[0] - np.shape(img)[0] % 8)
@@ -437,49 +321,31 @@ class PowerPaintController:
         base_image = input_image["image"].convert("RGB")
         set_seed(seed)
 
-        if self.version == "ppt-v1":
-            # for sd-inpainting based method
-            result = self.pipe(
-                promptA=promptA,
-                promptB=promptB,
-                tradoff=fitting_degree,
-                tradoff_nag=fitting_degree,
-                negative_promptA=negative_promptA,
-                negative_promptB=negative_promptB,
-                image=base_image,
-                mask=input_image["mask"].convert("RGB"),
-                width=H,
-                height=W,
-                guidance_scale=scale,
-                num_inference_steps=ddim_steps,
-            ).images[0]
-        else:
-            # for brushnet-based method
-            np_inpimg = np.asarray(base_image, dtype=np.float32)
-            # Outpainting creates an RGB mask while Gradio sketch masks are
-            # usually L.  Normalize both to one channel before broadcasting
-            # across the image's RGB channels.
-            np_inmask = np.asarray(input_image["mask"].convert("L"), dtype=np.float32) / 255.0
-            np_inpimg = np_inpimg * (1 - np_inmask[..., None])
-            masked_image = Image.fromarray(np_inpimg.astype(np.uint8)).convert("RGB")
-            result = self.pipe(
-                promptA=promptA,
-                promptB=promptB,
-                promptU=prompt,
-                tradoff=fitting_degree,
-                tradoff_nag=fitting_degree,
-                image=masked_image,
-                mask=input_image["mask"].convert("RGB"),
-                num_inference_steps=ddim_steps,
-                generator=torch.Generator("cuda").manual_seed(seed),
-                brushnet_conditioning_scale=1.0,
-                negative_promptA=negative_promptA,
-                negative_promptB=negative_promptB,
-                negative_promptU=negative_prompt,
-                guidance_scale=scale,
-                width=H,
-                height=W,
-            ).images[0]
+        np_inpimg = np.asarray(base_image, dtype=np.float32)
+        # Outpainting creates an RGB mask while Gradio sketch masks are
+        # usually L.  Normalize both to one channel before broadcasting
+        # across the image's RGB channels.
+        np_inmask = np.asarray(input_image["mask"].convert("L"), dtype=np.float32) / 255.0
+        np_inpimg = np_inpimg * (1 - np_inmask[..., None])
+        masked_image = Image.fromarray(np_inpimg.astype(np.uint8)).convert("RGB")
+        result = self.pipe(
+            promptA=promptA,
+            promptB=promptB,
+            promptU=prompt,
+            tradoff=fitting_degree,
+            tradoff_nag=fitting_degree,
+            image=masked_image,
+            mask=input_image["mask"].convert("RGB"),
+            num_inference_steps=ddim_steps,
+            generator=torch.Generator("cuda").manual_seed(seed),
+            brushnet_conditioning_scale=1.0,
+            negative_promptA=negative_promptA,
+            negative_promptB=negative_promptB,
+            negative_promptU=negative_prompt,
+            guidance_scale=scale,
+            width=H,
+            height=W,
+        ).images[0]
 
         final_result = compose_inpainted_result(base_image, result, input_image["mask"])
         mask_np = np.array(input_image["mask"].convert("RGB"))
@@ -497,89 +363,6 @@ class PowerPaintController:
         dict_res = [input_image["mask"].convert("RGB"), result_m]
         dict_out = [final_result]
         return dict_out, dict_res
-
-    def predict_controlnet(
-        self,
-        input_image,
-        input_control_image,
-        control_type,
-        prompt,
-        ddim_steps,
-        scale,
-        seed,
-        negative_prompt,
-        controlnet_conditioning_scale,
-    ):
-        promptA = prompt + " P_obj"
-        promptB = prompt + " P_obj"
-        negative_promptA = negative_prompt
-        negative_promptB = negative_prompt
-        input_image["image"] = input_image["image"].convert("RGB")
-        input_image["mask"] = prepare_editor_mask(input_image["mask"], input_image["image"].size)
-        size1, size2 = input_image["image"].size
-
-        if size1 < size2:
-            input_image["image"] = input_image["image"].convert("RGB").resize((640, int(size2 / size1 * 640)))
-        else:
-            input_image["image"] = input_image["image"].convert("RGB").resize((int(size1 / size2 * 640), 640))
-        img = np.array(input_image["image"].convert("RGB"))
-        W = int(np.shape(img)[0] - np.shape(img)[0] % 8)
-        H = int(np.shape(img)[1] - np.shape(img)[1] % 8)
-        input_image["image"] = input_image["image"].resize((H, W), Image.Resampling.LANCZOS)
-        input_image["mask"] = input_image["mask"].resize((H, W), Image.Resampling.NEAREST)
-        base_image = input_image["image"].convert("RGB")
-
-        if control_type != self.current_control:
-            self.load_controlnet(control_type)
-        controlnet_image = input_control_image
-        if control_type == "canny":
-            controlnet_image = controlnet_image.resize((H, W))
-            controlnet_image = np.array(controlnet_image)
-            controlnet_image = cv2.Canny(controlnet_image, 100, 200)
-            controlnet_image = controlnet_image[:, :, None]
-            controlnet_image = np.concatenate([controlnet_image, controlnet_image, controlnet_image], axis=2)
-            controlnet_image = Image.fromarray(controlnet_image)
-        elif control_type == "pose":
-            controlnet_image = self.openpose(controlnet_image)
-        elif control_type == "depth":
-            controlnet_image = controlnet_image.resize((H, W))
-            controlnet_image = self.get_depth_map(controlnet_image)
-        else:
-            controlnet_image = self.hed(controlnet_image)
-
-        mask_np = np.array(input_image["mask"].convert("RGB"))
-        controlnet_image = controlnet_image.resize((H, W))
-        set_seed(seed)
-        result = self.control_pipe(
-            promptA=promptB,
-            promptB=promptA,
-            tradoff=1.0,
-            tradoff_nag=1.0,
-            negative_promptA=negative_promptA,
-            negative_promptB=negative_promptB,
-            image=base_image,
-            mask=input_image["mask"].convert("RGB"),
-            control_image=controlnet_image,
-            width=H,
-            height=W,
-            guidance_scale=scale,
-            controlnet_conditioning_scale=controlnet_conditioning_scale,
-            num_inference_steps=ddim_steps,
-        ).images[0]
-        red = np.array(result).astype("float") * 1
-        red[:, :, 0] = 180.0
-        red[:, :, 2] = 0
-        red[:, :, 1] = 0
-        result_m = np.array(result)
-        result_m = Image.fromarray(
-            (
-                result_m.astype("float") * (1 - mask_np.astype("float") / 512.0)
-                + mask_np.astype("float") / 512.0 * red
-            ).astype("uint8")
-        )
-
-        final_result = compose_inpainted_result(base_image, result, input_image["mask"])
-        return [base_image, final_result], [controlnet_image, result_m]
 
     def infer(
         self,
@@ -602,10 +385,6 @@ class PowerPaintController:
         outpaint_prompt_language,
         removal_prompt,
         removal_negative_prompt,
-        enable_control=False,
-        input_control_image=None,
-        control_type="canny",
-        controlnet_conditioning_scale=None,
         enable_shape_guided=True,
     ):
         if task == "text-guided":
@@ -642,30 +421,15 @@ class PowerPaintController:
             prompt = self.resolve_prompt(text_guided_prompt, text_guided_prompt_language)
             negative_prompt = self.resolve_prompt(text_guided_negative_prompt, text_guided_prompt_language)
 
-        # currently, we only support controlnet in PowerPaint-v1
-        if self.version == "ppt-v1" and enable_control and task == "text-guided":
-            return self.predict_controlnet(
-                input_image,
-                input_control_image,
-                control_type,
-                prompt,
-                ddim_steps,
-                scale,
-                seed,
-                negative_prompt,
-                controlnet_conditioning_scale,
-            )
-        else:
-            return self.predict(
-                input_image, prompt, fitting_degree, ddim_steps, scale, seed, negative_prompt, task, None, None
-            )
+        return self.predict(
+            input_image, prompt, fitting_degree, ddim_steps, scale, seed, negative_prompt, task, None, None
+        )
 
 
 if __name__ == "__main__":
     args = argparse.ArgumentParser()
     args.add_argument("--weight_dtype", type=str, default="float16")
     args.add_argument("--checkpoint_dir", type=str, default="./checkpoints/ppt-v2")
-    args.add_argument("--version", type=str, default="ppt-v2")
     args.add_argument("--share", action="store_true")
     args.add_argument("--ngrok", action="store_true")
     args.add_argument("--ngrok_token", type=str, default="")
@@ -677,7 +441,7 @@ if __name__ == "__main__":
 
     # initialize the pipeline controller
     weight_dtype = torch.float16 if args.weight_dtype == "float16" else torch.float32
-    controller = PowerPaintController(weight_dtype, args.checkpoint_dir, args.local_files_only, args.version)
+    controller = PowerPaintController(weight_dtype, args.checkpoint_dir, args.local_files_only)
 
     css_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "style.css")
     with open(css_path, encoding="utf-8") as css_file:
@@ -794,14 +558,6 @@ if __name__ == "__main__":
                                 label="Ngôn ngữ prompt (áp dụng cho cả 2 ô)",
                                 value="Tự động",
                             )
-                            if args.version == "ppt-v1":
-                                with gr.Accordion("Cài đặt ControlNet", open=False):
-                                    enable_control = gr.Checkbox(label="Bật ControlNet")
-                                    controlnet_conditioning_scale = gr.Slider(
-                                        label="ControlNet conditioning scale", minimum=0, maximum=1, step=0.05, value=0.5
-                                    )
-                                    control_type = gr.Radio(["canny", "pose", "depth", "hed"], label="Control type", value="canny")
-                                    input_control_image = gr.Image(source="upload", type="pil", label="Control image")
                     tab_text_guided.select(fn=select_tab_text_guided, inputs=None, outputs=task)
 
                 run_button = gr.Button("✦  Chạy Inpainting", elem_id="run-button")
@@ -846,64 +602,32 @@ if __name__ == "__main__":
         removal_prompt = gr.State("")
         removal_negative_prompt = gr.State("")
 
-        if args.version == "ppt-v1":
-            run_button.click(
-                fn=controller.infer,
-                inputs=[
-                    input_image,
-                    text_guided_prompt,
-                    text_guided_negative_prompt,
-                    text_guided_prompt_language,
-                    shape_guided_prompt,
-                    shape_guided_negative_prompt,
-                    shape_guided_prompt_language,
-                    fitting_degree,
-                    ddim_steps,
-                    scale,
-                    seed,
-                    task,
-                    vertical_expansion_ratio,
-                    horizontal_expansion_ratio,
-                    outpaint_prompt,
-                    outpaint_negative_prompt,
-                    outpaint_prompt_language,
-                    removal_prompt,
-                    removal_negative_prompt,
-                    enable_control,
-                    input_control_image,
-                    control_type,
-                    controlnet_conditioning_scale,
-                    enable_shape_guided,
-                ],
-                outputs=[inpaint_result, gallery],
-            )
-        else:
-            run_button.click(
-                fn=controller.infer,
-                inputs=[
-                    input_image,
-                    text_guided_prompt,
-                    text_guided_negative_prompt,
-                    text_guided_prompt_language,
-                    shape_guided_prompt,
-                    shape_guided_negative_prompt,
-                    shape_guided_prompt_language,
-                    fitting_degree,
-                    ddim_steps,
-                    scale,
-                    seed,
-                    task,
-                    vertical_expansion_ratio,
-                    horizontal_expansion_ratio,
-                    outpaint_prompt,
-                    outpaint_negative_prompt,
-                    outpaint_prompt_language,
-                    removal_prompt,
-                    removal_negative_prompt,
-                    enable_shape_guided,
-                ],
-                outputs=[inpaint_result, gallery],
-            )
+        run_button.click(
+            fn=controller.infer,
+            inputs=[
+                input_image,
+                text_guided_prompt,
+                text_guided_negative_prompt,
+                text_guided_prompt_language,
+                shape_guided_prompt,
+                shape_guided_negative_prompt,
+                shape_guided_prompt_language,
+                fitting_degree,
+                ddim_steps,
+                scale,
+                seed,
+                task,
+                vertical_expansion_ratio,
+                horizontal_expansion_ratio,
+                outpaint_prompt,
+                outpaint_negative_prompt,
+                outpaint_prompt_language,
+                removal_prompt,
+                removal_negative_prompt,
+                enable_shape_guided,
+            ],
+            outputs=[inpaint_result, gallery],
+        )
 
     demo.queue()
     if args.ngrok:

@@ -36,7 +36,6 @@ dependencies:
     - charset-normalizer==3.3.2
     - click==8.1.7
     - contourpy==1.2.1
-    - controlnet-aux==0.0.3
     - cycler==0.12.1
     - diffusers==0.27.0
     - distlib==0.3.8
