@@ -439,7 +439,10 @@ class PowerPaintController:
         else:
             # for brushnet-based method
             np_inpimg = np.asarray(base_image, dtype=np.float32)
-            np_inmask = np.asarray(input_image["mask"], dtype=np.float32) / 255.0
+            # Outpainting creates an RGB mask while Gradio sketch masks are
+            # usually L.  Normalize both to one channel before broadcasting
+            # across the image's RGB channels.
+            np_inmask = np.asarray(input_image["mask"].convert("L"), dtype=np.float32) / 255.0
             np_inpimg = np_inpimg * (1 - np_inmask[..., None])
             masked_image = Image.fromarray(np_inpimg.astype(np.uint8)).convert("RGB")
             result = self.pipe(
