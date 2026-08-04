@@ -140,6 +140,7 @@ class PowerPaintController:
         self.version = version
         self.checkpoint_dir = checkpoint_dir
         self.local_files_only = local_files_only
+        self.weight_dtype = weight_dtype
         self.translation_model = None
         self.translation_tokenizer = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -257,28 +258,36 @@ class PowerPaintController:
             self.pipe.enable_model_cpu_offload()
             self.pipe = self.pipe.to("cuda")
 
+        self.load_translation_model()
+
+    def load_translation_model(self):
+        """Load the Vietnamese→English translation model up front."""
+        if self.translation_model is not None:
+            return
+        model_name = "facebook/nllb-200-distilled-600M"
+        try:
+            self.translation_tokenizer = AutoTokenizer.from_pretrained(
+                model_name, local_files_only=self.local_files_only
+            )
+            self.translation_tokenizer.src_lang = "vie_Latn"
+            self.translation_tokenizer.tgt_lang = "eng_Latn"
+            model_kwargs = {}
+            if self.weight_dtype == torch.float16 and self.device.type == "cuda":
+                model_kwargs["torch_dtype"] = torch.float16
+            self.translation_model = AutoModelForSeq2SeqLM.from_pretrained(
+                model_name, local_files_only=self.local_files_only, **model_kwargs
+            ).eval()
+            self.translation_model = self.translation_model.to(self.device)
+        except OSError as exc:
+            raise RuntimeError(
+                "Không tải được bộ dịch Việt–Anh. Hãy kết nối Internet một lần để tải "
+                "facebook/nllb-200-distilled-600M, hoặc dùng Prompt tiếng Anh."
+            ) from exc
+
     def translate_vietnamese_prompt(self, prompt):
-        """Translate Vietnamese on demand, keeping model start-up fast."""
+        """Translate Vietnamese with the preloaded NLLB model."""
         if not prompt or not prompt.strip():
             return ""
-
-        if self.translation_model is None:
-            model_name = "facebook/nllb-200-distilled-600M"
-            try:
-                self.translation_tokenizer = AutoTokenizer.from_pretrained(
-                    model_name, local_files_only=self.local_files_only
-                )
-                self.translation_tokenizer.src_lang = "vie_Latn"
-                self.translation_tokenizer.tgt_lang = "eng_Latn"
-                self.translation_model = AutoModelForSeq2SeqLM.from_pretrained(
-                    model_name, local_files_only=self.local_files_only
-                ).eval()
-                self.translation_model = self.translation_model.to(self.device)
-            except OSError as exc:
-                raise RuntimeError(
-                    "Không tải được bộ dịch Việt–Anh. Hãy kết nối Internet một lần để tải "
-                    "facebook/nllb-200-distilled-600M, hoặc dùng Prompt tiếng Anh."
-                ) from exc
 
         encoded = self.translation_tokenizer(
             prompt, return_tensors="pt", padding=True, truncation=True, max_length=256
@@ -597,6 +606,7 @@ class PowerPaintController:
         input_control_image=None,
         control_type="canny",
         controlnet_conditioning_scale=None,
+        enable_shape_guided=True,
     ):
         if task == "text-guided":
             prompt = self.resolve_prompt(text_guided_prompt, text_guided_prompt_language)
@@ -604,6 +614,8 @@ class PowerPaintController:
         elif task == "shape-guided":
             prompt = self.resolve_prompt(shape_guided_prompt, shape_guided_prompt_language)
             negative_prompt = self.resolve_prompt(shape_guided_negative_prompt, shape_guided_prompt_language)
+            if not enable_shape_guided:
+                task = "text-guided"
         elif task == "object-removal":
             # Object removal is deliberately prompt-free.  A higher CFG value
             # makes the model favour a clean continuation of the background.
@@ -713,7 +725,7 @@ if __name__ == "__main__":
                     with gr.Tab("✧  Shape-guided") as tab_shape_guided:
                         with gr.Group(elem_classes=["task-card"]):
                             enable_shape_guided = gr.Checkbox(
-                                label="Bật Shape Guided Inpainting", value=True, interactive=False
+                                label="Bật Shape Guided Inpainting", value=True, interactive=True
                             )
                             shape_guided_prompt = gr.Textbox(
                                 label="Positive Prompt",
@@ -861,6 +873,7 @@ if __name__ == "__main__":
                     input_control_image,
                     control_type,
                     controlnet_conditioning_scale,
+                    enable_shape_guided,
                 ],
                 outputs=[inpaint_result, gallery],
             )
@@ -887,6 +900,7 @@ if __name__ == "__main__":
                     outpaint_prompt_language,
                     removal_prompt,
                     removal_negative_prompt,
+                    enable_shape_guided,
                 ],
                 outputs=[inpaint_result, gallery],
             )
