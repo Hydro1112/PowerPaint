@@ -11,11 +11,11 @@ from controlnet_aux import HEDdetector, OpenposeDetector
 from PIL import Image, ImageFilter
 from safetensors.torch import load_model
 from transformers import (
+    AutoModelForSeq2SeqLM,
+    AutoTokenizer,
     CLIPTextModel,
     DPTFeatureExtractor,
     DPTForDepthEstimation,
-    MarianMTModel,
-    MarianTokenizer,
 )
 
 from diffusers import UniPCMultistepScheduler
@@ -142,6 +142,7 @@ class PowerPaintController:
         self.local_files_only = local_files_only
         self.translation_model = None
         self.translation_tokenizer = None
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # initialize powerpaint pipeline
         if version == "ppt-v1":
@@ -262,25 +263,32 @@ class PowerPaintController:
             return ""
 
         if self.translation_model is None:
-            model_name = "Helsinki-NLP/opus-mt-vi-en"
+            model_name = "facebook/nllb-200-distilled-600M"
             try:
-                self.translation_tokenizer = MarianTokenizer.from_pretrained(
+                self.translation_tokenizer = AutoTokenizer.from_pretrained(
                     model_name, local_files_only=self.local_files_only
                 )
-                self.translation_model = MarianMTModel.from_pretrained(
+                self.translation_tokenizer.src_lang = "vie_Latn"
+                self.translation_tokenizer.tgt_lang = "eng_Latn"
+                self.translation_model = AutoModelForSeq2SeqLM.from_pretrained(
                     model_name, local_files_only=self.local_files_only
                 ).eval()
+                self.translation_model = self.translation_model.to(self.device)
             except OSError as exc:
                 raise RuntimeError(
                     "Không tải được bộ dịch Việt–Anh. Hãy kết nối Internet một lần để tải "
-                    "Helsinki-NLP/opus-mt-vi-en, hoặc dùng Prompt tiếng Anh."
+                    "facebook/nllb-200-distilled-600M, hoặc dùng Prompt tiếng Anh."
                 ) from exc
 
         encoded = self.translation_tokenizer(
             prompt, return_tensors="pt", padding=True, truncation=True, max_length=256
-        )
+        ).to(self.device)
         with torch.no_grad():
-            translated = self.translation_model.generate(**encoded, max_new_tokens=256)
+            translated = self.translation_model.generate(
+                **encoded,
+                max_new_tokens=256,
+                forced_bos_token_id=self.translation_tokenizer.convert_tokens_to_ids("eng_Latn"),
+            )
         return self.translation_tokenizer.batch_decode(translated, skip_special_tokens=True)[0]
 
     def resolve_prompt(self, prompt, language="Tự động"):
