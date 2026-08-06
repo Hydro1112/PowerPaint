@@ -887,7 +887,13 @@ def main(args):
 
     @torch.no_grad()
     def run_validation_loss():
-        """Evaluate the held-out set with the same diffusion objective as training."""
+        """Evaluate the held-out set with the same diffusion objective as training.
+
+        Noise and timesteps are drawn from a generator seeded by global_step so
+        the reported loss is reproducible between runs (dataset masks are already
+        seeded by sample idx inside COCODataset for validation).
+        """
+        val_generator = torch.Generator(device=accelerator.device).manual_seed(global_step)
         brushnet.eval()
         text_encoder.eval()
         total_loss = torch.zeros((), device=accelerator.device)
@@ -903,9 +909,13 @@ def main(args):
             mask_image_latents = (mask_image_latents * vae.config.scaling_factor).to(weight_dtype)
             conditioning_latents = torch.concat([mask, mask_image_latents], 1)
 
-            noise = torch.randn_like(latents)
+            noise = torch.randn(latents.shape, generator=val_generator)
             timesteps = torch.randint(
-                0, noise_scheduler.config.num_train_timesteps, (latents.shape[0],), device=latents.device
+                0,
+                noise_scheduler.config.num_train_timesteps,
+                (latents.shape[0],),
+                device=latents.device,
+                generator=val_generator,
             ).long()
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
             encoder_hidden_states_unet = text_encoder(batch["input_ids"], return_dict=False)[0]

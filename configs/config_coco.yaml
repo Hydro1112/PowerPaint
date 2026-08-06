@@ -16,7 +16,7 @@ checkpoints_total_limit: 5
 max_train_samples: null
 use_8bit_adam: true
 allow_tf32: true
-dataloader_num_workers: 2
+dataloader_num_workers: 4
 train_data:
   datasets:
   - dataset_class: COCODataset
