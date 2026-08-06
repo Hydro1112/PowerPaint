@@ -10,11 +10,11 @@ Usage:
 ```bash
 # dry run
 python submit.py --job-name powerpaint --gpus 16 --dry-run \
-    train_ppt1_sd15.py --config configs/ppt1_sd15.yaml
+    train_ppt2_bn.py --config configs/ppt2_bn.yaml
 
 # or direct start!
 python submit.py --job-name powerpaint --gpus 16 \
-    train_ppt1_sd15.py --config configs/ppt1_sd15.yaml
+    train_ppt2_bn.py --config configs/ppt2_bn.yaml
 ```
 """
 

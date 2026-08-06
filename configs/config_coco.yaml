@@ -6,13 +6,13 @@ resolution: 512
 train_batch_size: 2
 gradient_accumulation_steps: 8
 num_train_epochs: 5
-learning_rate: 5e-6
+learning_rate: 1e-5
 mixed_precision: fp16
 gradient_checkpointing: true
 enable_xformers_memory_efficient_attention: true
 checkpointing_steps: 1000
-validation_steps: 999999
-checkpoints_total_limit: 3
+validation_steps: 1000
+checkpoints_total_limit: 5
 max_train_samples: null
 use_8bit_adam: true
 allow_tf32: true

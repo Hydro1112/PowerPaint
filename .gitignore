@@ -19,3 +19,6 @@ data/
 *.gif
 
 debug*
+.env
+.code-review-graph
+.commandcode
