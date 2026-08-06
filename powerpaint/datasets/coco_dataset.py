@@ -130,7 +130,13 @@ class COCODataset(torch.utils.data.Dataset):
                 ))
             elif isinstance(t, transforms.RandomHorizontalFlip):
                 mask_transforms_list.append(transforms.RandomHorizontalFlip(p=t.p))
-            elif isinstance(t, (transforms.Resize, transforms.CenterCrop, transforms.RandomCrop)):
+            elif isinstance(t, transforms.Resize):
+                # Mask phải dùng NEAREST để giữ mask nhị phân (0/255), không tạo
+                # pixel xám ở biên do nội suy (validation dùng Resize + CenterCrop).
+                mask_transforms_list.append(transforms.Resize(
+                    t.size, interpolation=transforms.InterpolationMode.NEAREST
+                ))
+            elif isinstance(t, (transforms.CenterCrop, transforms.RandomCrop)):
                 mask_transforms_list.append(t)
             else:
                 break
@@ -213,8 +219,9 @@ class COCODataset(torch.utils.data.Dataset):
           2. Lọc annotation hợp lệ (iscrowd=0, area đủ lớn).
           3. Random chọn 1 object.
           4. annToMask() -> mask ở kích thước ảnh B.
-          5. Random scale + rotate + translate (affine) để mask không phụ thuộc vị trí gốc.
-          6. Resize về kích thước ảnh A (INTER_NEAREST).
+          5. Quy đổi mask về không gian ảnh A (contain, giữ aspect ratio).
+          6. Random scale (CROSS_MASK_SCALE) + rotate + translate (affine).
+          7. Paste lên canvas ảnh A.
         """
         if rng is None:
             rng = random
@@ -237,15 +244,25 @@ class COCODataset(torch.utils.data.Dataset):
                 continue
 
             mask_img = Image.fromarray(np.uint8(ann_mask * 255))  # L mode
-            w_b, h_b = mask_img.size
 
-            # 5. Affine: scale -> rotate -> translate
+            # 5. Crop về bounding box của object B để scale có ý nghĩa tương đối
+            #    với ảnh A: scale=1.0 -> object phủ ~100% ảnh A, scale=0.3 -> ~30%.
+            ys, xs = np.where(np.asarray(mask_img) > 0)
+            if len(xs) == 0 or len(ys) == 0:
+                continue
+            bw, bh = int(xs.max() - xs.min() + 1), int(ys.max() - ys.min() + 1)
+            mask_img = mask_img.crop((int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1))
+
+            # 6. Affine: scale tương đối với ảnh A -> rotate -> translate
             scale = rng.uniform(*self.cross_mask_scale)
             angle = rng.uniform(*self.cross_mask_rotation)
 
-            # scale quanh tâm
-            new_w = max(1, int(w_b * scale))
-            new_h = max(1, int(h_b * scale))
+            # scale bbox object B vào khung (scale * ảnh A), giữ aspect ratio.
+            target_w = max(1, int(width_A * scale))
+            target_h = max(1, int(height_A * scale))
+            fit = min(target_w / bw, target_h / bh)
+            new_w = max(1, int(bw * fit))
+            new_h = max(1, int(bh * fit))
             mask_img = mask_img.resize((new_w, new_h), Image.NEAREST)
 
             # rotate (expand để không cắt mask)
@@ -257,8 +274,7 @@ class COCODataset(torch.utils.data.Dataset):
             dx = rng.randint(-max_dx, max_dx)
             dy = rng.randint(-max_dy, max_dy)
 
-            # 6. Resize về kích thước ảnh A
-            mask_img = mask_img.resize((width_A, height_A), Image.NEAREST)
+            # 7. Paste lên canvas ảnh A
             canvas = Image.new("L", (width_A, height_A), 0)
             canvas.paste(mask_img, (dx, dy))
             mask_img = canvas

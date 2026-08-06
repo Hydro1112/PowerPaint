@@ -1,3 +1,5 @@
+seed: 42
+resume_from_checkpoint: latest
 pretrained_model_name_or_path: /content/gdrive/MyDrive/Train_PowerPaint/PowerPaint/checkpoints/ppt-v2/realisticVisionV60B1_v51VAE
 base_model_name_or_path: /content/gdrive/MyDrive/Train_PowerPaint/PowerPaint/checkpoints/ppt-v2/realisticVisionV60B1_v51VAE
 powerpaint_model_name_or_path: /content/gdrive/MyDrive/Train_PowerPaint/PowerPaint/checkpoints/ppt-v2/PowerPaint_Brushnet

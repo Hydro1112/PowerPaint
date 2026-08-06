@@ -3,9 +3,11 @@
 
 import argparse
 import gc
+import json
 import logging
 import math
 import os
+import random
 import shutil
 from pathlib import Path
 
@@ -260,7 +262,7 @@ def parse_args(input_args=None):
         default=None,
         help="The directory where the downloaded models and datasets will be stored.",
     )
-    parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
+    parser.add_argument("--seed", type=int, default=42, help="A seed for reproducible training.")
     parser.add_argument(
         "--resolution",
         type=int,
@@ -504,8 +506,18 @@ def parse_args(input_args=None):
     # use omegaconf to manage configurations
     if args.config is not None:
         config = OmegaConf.load(args.config)
-        for k, v in config.items():
-            args.__dict__[k] = v
+        # `args` chứa default cho mọi arg; parse lại với [] để lấy default gốc.
+        # Chỉ áp config cho key user KHÔNG truyền qua CLI (giá trị == default)
+        # -> CLI luôn thắng config (vd: --resume_from_checkpoint từ notebook
+        #    thắng resume_from_checkpoint: latest trong YAML).
+        try:
+            default_args = parser.parse_args([])
+        except SystemExit:
+            default_args = None
+        if default_args is not None:
+            for k, v in config.items():
+                if getattr(args, k, None) == getattr(default_args, k, None):
+                    args.__dict__[k] = v
 
     if args.proportion_empty_prompts < 0 or args.proportion_empty_prompts > 1:
         raise ValueError("`--proportion_empty_prompts` must be in the range [0, 1].")
@@ -862,6 +874,30 @@ def main(args):
     else:
         initial_global_step = 0
 
+    # Track the best validation loss and export the corresponding weights.
+    best_validation_loss = float("inf")
+    best_ckpt_step = None
+    best_ckpt_name = None
+    best_ckpt_dir = os.path.join(args.output_dir, "best_model")
+
+    # Restore best-checkpoint state from a previous run so that resuming keeps
+    # the historical best instead of resetting it.
+    if accelerator.is_main_process and args.resume_from_checkpoint:
+        validation_log_path = os.path.join(args.output_dir, "validation_log.csv")
+        if os.path.exists(validation_log_path):
+            with open(validation_log_path, "r") as f:
+                lines = [ln.strip() for ln in f if ln.strip() and not ln.startswith("step")]
+            best_line = min(lines, key=lambda ln: float(ln.split(",")[1]), default=None) if lines else None
+            if best_line is not None:
+                best_step, best_loss = best_line.split(",")[0], float(best_line.split(",")[1])
+                best_validation_loss = best_loss
+                best_ckpt_step = int(best_step)
+                best_ckpt_name = f"checkpoint-{best_step}"
+                logger.info(
+                    f"Resumed best-checkpoint state: best_validation_loss={best_validation_loss:.6f} "
+                    f"at step {best_ckpt_step}"
+                )
+
     progress_bar = tqdm(
         range(0, int(args.max_train_steps)),
         initial=initial_global_step,
@@ -884,6 +920,54 @@ def main(args):
 
     # keep original embeddings as reference
     orig_embeds_params = accelerator.unwrap_model(text_encoder).get_input_embeddings().weight.data.clone()
+
+    def _export_model(export_dir, source_tokenizer, source_text_encoder, source_brushnet):
+        """Export the full runnable artifact: brushnet, updated text encoder
+        (learned task-token embeddings), and tokenizer with the extended vocab.
+
+        The exported text_encoder is the standalone CLIPTextModel (the same
+        class used for inference with the brushnet pipeline), not the frozen
+        pipe.text_encoder. Token embeddings outside the task-token range are
+        reverted to the original checkpoint so the export is self-contained.
+        """
+        os.makedirs(export_dir, exist_ok=True)
+
+        source_brushnet.save_pretrained(export_dir)
+
+        # Export the full tokenizer (extended vocab incl. P_obj / P_ctxt).
+        source_tokenizer.save_pretrained(export_dir)
+
+        # Export the trained text encoder with the fine-tuned embeddings.
+        text_encoder_export = import_model_class_from_model_name_or_path(
+            args.pretrained_model_name_or_path, args.revision
+        ).from_pretrained(
+            args.pretrained_model_name_or_path,
+            subfolder="text_encoder",
+            revision=args.revision,
+            variant=args.variant,
+        )
+        # The exported encoder starts from the base vocab; resize it to the
+        # extended vocab (incl. task tokens) before copying trained embeddings.
+        text_encoder_export.resize_token_embeddings(len(source_tokenizer))
+        index_no_updates = torch.ones((len(source_tokenizer),), dtype=torch.bool)
+        index_no_updates[min(placeholder_token_ids) : max(placeholder_token_ids) + 1] = False
+        with torch.no_grad():
+            trained_embeds = source_text_encoder.get_input_embeddings().weight.data.clone()
+            # Restore original embeddings outside the extended task-token ids.
+            trained_embeds[index_no_updates] = orig_embeds_params[index_no_updates]
+            text_encoder_export.get_input_embeddings().weight.data.copy_(trained_embeds)
+        text_encoder_export.save_pretrained(export_dir)
+
+        # Manifest: base model + best checkpoint needed for inference.
+        manifest = {
+            "base_model_name_or_path": args.pretrained_model_name_or_path,
+            "best_checkpoint": best_ckpt_name,
+            "best_validation_loss": best_validation_loss,
+            "best_step": best_ckpt_step,
+            "task_prompts": {k: v.placeholder_tokens for k, v in args.task_prompt.items()},
+        }
+        with open(os.path.join(export_dir, "inference_manifest.json"), "w") as f:
+            json.dump(manifest, f, indent=2)
 
     @torch.no_grad()
     def run_validation_loss():
@@ -1096,6 +1180,24 @@ def main(args):
                         validation_file.write(f"{global_step},{validation_loss}\n")
                         validation_file.flush()
 
+                        # Save the best checkpoint based on held-out loss.
+                        if validation_loss < best_validation_loss:
+                            best_validation_loss = validation_loss
+                            best_ckpt_step = global_step
+                            best_ckpt_name = f"checkpoint-{global_step}"
+                            logger.info(
+                                f"New best validation loss {validation_loss:.6f} at step "
+                                f"{global_step}; exporting best_model/"
+                            )
+                            if os.path.isdir(best_ckpt_dir):
+                                shutil.rmtree(best_ckpt_dir)
+                            _export_model(
+                                best_ckpt_dir,
+                                accelerator.unwrap_model(tokenizer),
+                                accelerator.unwrap_model(text_encoder),
+                                accelerator.unwrap_model(brushnet),
+                            )
+
                 if accelerator.is_main_process:
                     if global_step % args.checkpointing_steps == 0:
                         # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
@@ -1149,14 +1251,42 @@ def main(args):
             validation_file.write(f"{global_step},{validation_loss}\n")
             validation_file.flush()
 
+            if validation_loss < best_validation_loss:
+                best_validation_loss = validation_loss
+                best_ckpt_step = global_step
+                best_ckpt_name = f"checkpoint-{global_step}"
+                logger.info(
+                    f"New best validation loss {validation_loss:.6f} at step {global_step}; "
+                    f"exporting best_model/"
+                )
+                if os.path.isdir(best_ckpt_dir):
+                    shutil.rmtree(best_ckpt_dir)
+                _export_model(
+                    best_ckpt_dir,
+                    accelerator.unwrap_model(tokenizer),
+                    accelerator.unwrap_model(text_encoder),
+                    accelerator.unwrap_model(brushnet),
+                )
+
     # Create the pipeline using using the trained modules and save it.
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         if validation_dataloader is not None:
             validation_file.close()
         loss_file.close()
+
         brushnet = unwrap_model(brushnet)
-        brushnet.save_pretrained(args.output_dir)
+        # Full artifact for the final step.
+        _export_model(args.output_dir, tokenizer, text_encoder, brushnet)
+
+        # Report the best checkpoint for inference.
+        if best_ckpt_step is not None:
+            logger.info(
+                f"Best validation loss {best_validation_loss:.6f} at step {best_ckpt_step} "
+                f"-> {best_ckpt_dir} (use this for inference)"
+            )
+        else:
+            logger.info("No validation ran; output_models/ is the final-step artifact")
 
         # Run a final round of validation.
         image_logs = None
