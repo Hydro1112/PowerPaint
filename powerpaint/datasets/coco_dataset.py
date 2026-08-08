@@ -192,7 +192,8 @@ class COCODataset(torch.utils.data.Dataset):
 
         if not ann_ids:
             # Không còn annotation nào khả dụng: mask đen (mô hình xem như không có gì để inpaint).
-            return Image.new("L", image_size, 0)
+            # Image.new nhận size dạng (W, H) trong khi image_size là (H, W).
+            return Image.new("L", (image_size[1], image_size[0]), 0)
 
         # Random chọn 1..max(1, max_objects) object trong ảnh, không vượt quá số ann có sẵn.
         max_k = min(self.max_objects, len(ann_ids))
@@ -204,8 +205,11 @@ class COCODataset(torch.utils.data.Dataset):
             ann_mask = self.coco.annToMask(self.coco.loadAnns([ann_id])[0])
             # annToMask trả về mask ở kích thước ảnh gốc; resize về image_size nếu khác.
             if ann_mask.shape != image_size:
+                # PIL resize nhận (W, H); image_size là (H, W) nên phải đảo thứ tự.
                 ann_mask = np.asarray(
-                    Image.fromarray(ann_mask).resize(image_size, Image.NEAREST)
+                    Image.fromarray(ann_mask).resize(
+                        (image_size[1], image_size[0]), Image.NEAREST
+                    )
                 )
             mask = np.maximum(mask, ann_mask)
 
