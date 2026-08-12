@@ -68,6 +68,62 @@ def add_task(prompt, negative_prompt, control_type):
     return promptA, promptB, negative_promptA, negative_promptB
 
 
+def compose_inpainted_result(
+    base_image,
+    generated,
+    mask,
+    blur_radius=0,
+    feather_edge_px=0.7,
+    sharpen_radius=1.2,
+    sharpen_percent=100,
+    sharpen_threshold=2,
+    color_match=True,
+    color_match_ring_px=12,
+):
+    """Blend generated pixels into the source image with color/seam cleanup."""
+    generated = generated.convert("RGB").resize(base_image.size, Image.Resampling.LANCZOS)
+    base_image = base_image.convert("RGB")
+    mask_l = mask.convert("L").resize(base_image.size, Image.Resampling.NEAREST)
+    hard_mask = mask_l.point(lambda pixel: 255 if pixel > 127 else 0, mode="L")
+
+    if color_match:
+        ring_px = max(1, int(color_match_ring_px))
+        outer = hard_mask.filter(ImageFilter.MaxFilter(size=ring_px * 2 + 1))
+        mask_np = np.asarray(hard_mask, dtype=np.uint8) > 0
+        ring_np = (np.asarray(outer, dtype=np.uint8) > 0) & (~mask_np)
+        if ring_np.any():
+            base_np = np.asarray(base_image, dtype=np.float32)
+            gen_np = np.asarray(generated, dtype=np.float32)
+            base_mean = base_np[ring_np].mean(axis=0)
+            gen_mean = gen_np[ring_np].mean(axis=0)
+            base_std = base_np[ring_np].std(axis=0) + 1e-6
+            gen_std = gen_np[ring_np].std(axis=0) + 1e-6
+            matched = (gen_np - gen_mean) * (base_std / gen_std) + base_mean
+            generated = Image.fromarray(np.uint8(np.clip(matched, 0, 255)))
+
+    if blur_radius and blur_radius > 0:
+        generated = generated.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    if sharpen_percent and sharpen_percent > 0:
+        generated = generated.filter(
+            ImageFilter.UnsharpMask(
+                radius=sharpen_radius,
+                percent=sharpen_percent,
+                threshold=sharpen_threshold,
+            )
+        )
+
+    if feather_edge_px and feather_edge_px > 0:
+        alpha = hard_mask.filter(ImageFilter.GaussianBlur(radius=feather_edge_px))
+    else:
+        alpha = hard_mask
+
+    alpha_np = (np.asarray(alpha, dtype=np.float32) / 255.0)[..., None]
+    base_np = np.asarray(base_image, dtype=np.float32) / 255.0
+    gen_np = np.asarray(generated, dtype=np.float32) / 255.0
+    out = base_np * (1.0 - alpha_np) + gen_np * alpha_np
+    return Image.fromarray(np.uint8(np.clip(out * 255.0, 0, 255)))
+
+
 def select_tab_text_guided():
     return "text-guided"
 
@@ -85,10 +141,20 @@ def select_tab_shape_guided():
 
 
 class PowerPaintController:
-    def __init__(self, weight_dtype, checkpoint_dir, local_files_only, enable_nsfw_filter=True) -> None:
+    def __init__(
+        self,
+        weight_dtype,
+        checkpoint_dir,
+        local_files_only,
+        enable_nsfw_filter=True,
+        preserve_original=False,
+        mask_feather_radius=0.7,
+    ) -> None:
         self.checkpoint_dir = checkpoint_dir
         self.local_files_only = local_files_only
         self.weight_dtype = weight_dtype
+        self.preserve_original = preserve_original
+        self.mask_feather_radius = mask_feather_radius
         self.translation_model = None
         self.translation_tokenizer = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -302,6 +368,7 @@ class PowerPaintController:
         H = int(np.shape(img)[1] - np.shape(img)[1] % 8)
         input_image["image"] = input_image["image"].resize((H, W))
         input_image["mask"] = input_image["mask"].resize((H, W))
+        original_image = input_image["image"].copy()
         set_seed(seed)
 
         np_inpimg = np.array(input_image["image"])
@@ -333,7 +400,20 @@ class PowerPaintController:
                 "Vui lòng thử lại với prompt hoặc ảnh khác."
             )
 
-        final_result = result
+        if self.preserve_original:
+            final_result = compose_inpainted_result(
+                original_image,
+                result,
+                input_image["mask"],
+                feather_edge_px=self.mask_feather_radius,
+                sharpen_radius=1.2,
+                sharpen_percent=100,
+                sharpen_threshold=2,
+                color_match=True,
+                color_match_ring_px=12,
+            )
+        else:
+            final_result = result
         mask_np = np.array(input_image["mask"].convert("RGB"))
         # Gallery previews are resized by the browser.  Return a binary mask
         # for the mask panel so its edges stay crisp instead of showing the
@@ -446,13 +526,29 @@ if __name__ == "__main__":
         action="store_true",
         help="disable the 18+ filter (prompt keywords and image classifier)",
     )
+    args.add_argument(
+        "--preserve-original",
+        action="store_true",
+        help="keep the source image outside the mask and use model output only inside the mask",
+    )
+    args.add_argument(
+        "--mask-feather-radius",
+        type=float,
+        default=0.7,
+        help="soften the mask edge when compositing (0 disables feathering)",
+    )
     args.add_argument("--port", type=int, default=7860)
     args = args.parse_args()
 
     # initialize the pipeline controller
     weight_dtype = torch.float16 if args.weight_dtype == "float16" else torch.float32
     controller = PowerPaintController(
-        weight_dtype, args.checkpoint_dir, args.local_files_only, enable_nsfw_filter=not args.no_nsfw_filter
+        weight_dtype,
+        args.checkpoint_dir,
+        args.local_files_only,
+        enable_nsfw_filter=not args.no_nsfw_filter,
+        preserve_original=args.preserve_original,
+        mask_feather_radius=args.mask_feather_radius,
     )
 
     css_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "style.css")
