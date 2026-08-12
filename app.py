@@ -1,6 +1,7 @@
 import argparse
 import os
 import random
+import re
 from pyngrok import ngrok
 
 import gradio as gr
@@ -23,6 +24,14 @@ from powerpaint.utils.utils import TokenizerWrapper, add_tokens
 
 
 torch.set_grad_enabled(False)
+
+# Common Vietnamese words that remain unchanged when users type without
+# diacritics.  This keeps Auto mode useful for prompts such as "con ong".
+VIETNAMESE_HINT_WORDS = {
+    "anh", "ban", "be", "bich", "bo", "cai", "canh", "cho", "chiec", "co", "con", "cua",
+    "den", "do", "duoi", "ghe", "hinh", "khong", "lam", "mau", "mot", "ngoai", "nguoi",
+    "ong", "phia", "tren", "trong", "va", "vat", "voi", "xanh", "xoa", "thay", "them",
+}
 
 # Gradio converts a sketch's alpha channel to a white RGB mask before calling
 # this app. Accept RGBA too, so direct callers follow the same convention.
@@ -197,9 +206,12 @@ class PowerPaintController:
             return self.translate_vietnamese_prompt(prompt)
         if language == "English":
             return prompt
-        if any(
+        has_vietnamese_diacritic = any(
             character in "ăâđêôơưĂÂĐÊÔƠƯ" or "\u1ea0" <= character <= "\u1ef9" for character in prompt
-        ):
+        )
+        words = set(re.findall(r"[a-zA-ZÀ-ỹĐđ]+", prompt.lower()))
+        has_vietnamese_word = bool(words & VIETNAMESE_HINT_WORDS)
+        if has_vietnamese_diacritic or has_vietnamese_word:
             return self.translate_vietnamese_prompt(prompt)
         return prompt
 
@@ -279,7 +291,10 @@ class PowerPaintController:
         if task == "image-outpainting":
             prompt = prompt + " empty scene"
         if task == "object-removal":
-            prompt = prompt + " empty scene blur"
+            # Do not ask the diffusion model to blur the filled area.  This
+            # used to make the result preview look like a broken/soft image,
+            # especially when removing text or watermarks.
+            prompt = prompt + " empty scene"
         promptA, promptB, negative_promptA, negative_promptB = add_task(prompt, negative_prompt, task)
 
         img = np.array(input_image["image"].convert("RGB"))
@@ -320,18 +335,11 @@ class PowerPaintController:
 
         final_result = result
         mask_np = np.array(input_image["mask"].convert("RGB"))
-        red = np.array(result).astype("float") * 1
-        red[:, :, 0] = 180.0
-        red[:, :, 2] = 0
-        red[:, :, 1] = 0
-        result_m = np.array(result)
-        result_m = Image.fromarray(
-            (
-                result_m.astype("float") * (1 - mask_np.astype("float") / 512.0)
-                + mask_np.astype("float") / 512.0 * red
-            ).astype("uint8")
-        )
-        dict_res = [input_image["mask"].convert("RGB"), result_m]
+        # Gallery previews are resized by the browser.  Return a binary mask
+        # for the mask panel so its edges stay crisp instead of showing the
+        # semi-transparent result overlay as a second, blurry image.
+        display_mask = Image.fromarray(((mask_np[:, :, 0] > 127) * 255).astype("uint8"), mode="L").convert("RGB")
+        dict_res = [display_mask]
         dict_out = [final_result]
         return dict_out, dict_res
 
@@ -588,14 +596,17 @@ if __name__ == "__main__":
                 gr.HTML("<div class='section-title'>Kết quả Inpainting</div>", elem_classes=["section-title-wrap"])
                 with gr.Group(elem_classes=["panel-card", "output-card"]):
                     inpaint_result = gr.Gallery(
-                        label="Generated images", show_label=False, columns=1, elem_id="result-gallery"
+                        label="Generated images", show_label=False, columns=1, object_fit="contain",
+                        elem_id="result-gallery"
                     )
                 gr.HTML(
                     "<div class='section-title mask-section-title'>Mask (vùng chỉnh sửa)</div>",
                     elem_classes=["section-title-wrap"],
                 )
                 with gr.Group(elem_classes=["panel-card", "mask-card"]):
-                    gallery = gr.Gallery(label="Generated masks", show_label=False, columns=1, elem_id="mask-gallery")
+                    gallery = gr.Gallery(
+                        label="Generated masks", show_label=False, columns=1, object_fit="contain", elem_id="mask-gallery"
+                    )
 
         tab_object_removal.select(
             fn=select_tab_object_removal,
