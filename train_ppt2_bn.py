@@ -993,7 +993,7 @@ def main(args):
             mask_image_latents = (mask_image_latents * vae.config.scaling_factor).to(weight_dtype)
             conditioning_latents = torch.concat([mask, mask_image_latents], 1)
 
-            noise = torch.randn(latents.shape, generator=val_generator)
+            noise = torch.randn(latents.shape, generator=val_generator, device=latents.device)
             timesteps = torch.randint(
                 0,
                 noise_scheduler.config.num_train_timesteps,

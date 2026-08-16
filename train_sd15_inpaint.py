@@ -256,6 +256,12 @@ def parse_args(input_args=None):
     parser.add_argument("--enable_xformers_memory_efficient_attention", action="store_true")
     parser.add_argument("--set_grads_to_none", action="store_true")
     parser.add_argument("--max_train_samples", type=int, default=None)
+    parser.add_argument(
+        "--max_validation_samples",
+        type=int,
+        default=None,
+        help="Limit the number of validation samples (useful for quick smoke tests). Default: full validation set.",
+    )
     parser.add_argument("--proportion_empty_prompts", type=float, default=0)
     parser.add_argument("--snr_gamma", type=float, default=None, help="SNR weighting gamma to be used if rebalancing the loss. Recommended value is 5.0.")
     parser.add_argument(
@@ -519,6 +525,12 @@ def main(args):
             is_validation=True,
             **args.validation_dataset,
         )
+        if args.max_validation_samples is not None:
+            validation_dataset.data = validation_dataset.data[: args.max_validation_samples]
+            logger.info(
+                "Validation limited to %d samples (--max_validation_samples)",
+                len(validation_dataset),
+            )
         validation_dataloader = torch.utils.data.DataLoader(
             validation_dataset,
             batch_size=getattr(args, "validation_batch_size", args.train_batch_size),
@@ -714,7 +726,7 @@ def main(args):
             masked_latents = vae.encode(masked_image.to(dtype=weight_dtype)).latent_dist.sample()
             masked_latents = (masked_latents * vae.config.scaling_factor).to(weight_dtype)
 
-            noise = torch.randn(latents.shape, generator=val_generator)
+            noise = torch.randn(latents.shape, generator=val_generator, device=latents.device)
             timesteps = torch.randint(
                 0,
                 noise_scheduler.config.num_train_timesteps,
