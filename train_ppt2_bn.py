@@ -907,7 +907,7 @@ def main(args):
     )
 
     image_logs = None
-    log_interval = 100
+    log_interval = 10
 
     if accelerator.is_main_process:
         loss_log_path = os.path.join(args.output_dir, "training_log.csv")
@@ -1045,7 +1045,9 @@ def main(args):
         text_encoder.train()
         return validation_loss
 
+    logger.info("Training started. Progress lines are printed every %d steps.", log_interval)
     for epoch in range(first_epoch, args.num_train_epochs):
+        logger.info("===== Starting epoch %d/%d =====", epoch + 1, args.num_train_epochs)
         train_loss = 0.0
         for batch in train_dataloader:
             with accelerator.accumulate(brushnet):
@@ -1167,7 +1169,15 @@ def main(args):
                 accelerator.log({"train_loss": train_loss}, step=global_step)
 
                 if accelerator.is_main_process and global_step % log_interval == 0:
-                    loss_file.write(f"{global_step},{epoch},{loss.detach().item()},{train_loss},{lr_scheduler.get_last_lr()[0]},{grad_norm}\n")
+                    cur_lr = lr_scheduler.get_last_lr()[0]
+                    eta_steps = int(args.max_train_steps) - global_step
+                    logger.info(
+                        f"[step {global_step}/{int(args.max_train_steps)}] "
+                        f"epoch {epoch} | train_loss {train_loss:.6f} | "
+                        f"step_loss {loss.detach().item():.6f} | lr {cur_lr:.2e} | "
+                        f"grad_norm {grad_norm:.4f} | eta_steps {eta_steps}"
+                    )
+                    loss_file.write(f"{global_step},{epoch},{loss.detach().item()},{train_loss},{cur_lr},{grad_norm}\n")
                     loss_file.flush()
 
                 train_loss = 0.0
