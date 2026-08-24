@@ -1,28 +1,40 @@
 import argparse
 import os
 import random
+import re
 from pyngrok import ngrok
-import cv2
+
 import gradio as gr
 import numpy as np
 import torch
-from controlnet_aux import HEDdetector, OpenposeDetector
 from PIL import Image, ImageFilter
 from safetensors.torch import load_model
-from transformers import CLIPTextModel, DPTImageProcessor, DPTForDepthEstimation
+from transformers import (
+    AutoModelForSeq2SeqLM,
+    AutoTokenizer,
+    CLIPTextModel,
+)
+
 from diffusers import UniPCMultistepScheduler
-from diffusers.pipelines.controlnet.pipeline_controlnet import ControlNetModel
 from powerpaint.models.BrushNet_CA import BrushNetModel
 from powerpaint.models.unet_2d_condition import UNet2DConditionModel
-from powerpaint.pipelines.pipeline_PowerPaint import StableDiffusionInpaintPipeline as Pipeline
 from powerpaint.pipelines.pipeline_PowerPaint_Brushnet_CA import StableDiffusionPowerPaintBrushNetPipeline
-from powerpaint.pipelines.pipeline_PowerPaint_ControlNet import (
-    StableDiffusionControlNetInpaintPipeline as controlnetPipeline,
-)
+from powerpaint.utils.content_filter import NSFWImageFilter, prompt_is_blocked
 from powerpaint.utils.utils import TokenizerWrapper, add_tokens
 
 
 torch.set_grad_enabled(False)
+
+# Common Vietnamese words that remain unchanged when users type without
+# diacritics.  This keeps Auto mode useful for prompts such as "con ong".
+VIETNAMESE_HINT_WORDS = {
+    "anh", "ban", "be", "bich", "bo", "cai", "canh", "cho", "chiec", "co", "con", "cua",
+    "den", "do", "duoi", "ghe", "hinh", "khong", "lam", "mau", "mot", "ngoai", "nguoi",
+    "ong", "phia", "tren", "trong", "va", "vat", "voi", "xanh", "xoa", "thay", "them",
+}
+
+# Gradio converts a sketch's alpha channel to a white RGB mask before calling
+# this app. Accept RGBA too, so direct callers follow the same convention.
 
 
 def set_seed(seed):
@@ -33,34 +45,83 @@ def set_seed(seed):
     random.seed(seed)
 
 
-def add_task(prompt, negative_prompt, control_type, version):
-    pos_prefix = neg_prefix = ""
+def add_task(prompt, negative_prompt, control_type):
+    # The brushnet pipeline only needs the prompt in `promptU`; keeping the
+    # prompt and negative prompt out of promptA/promptB matches the reference
+    # implementation and avoids over-conditioning that shifts output colours.
     if control_type == "object-removal" or control_type == "image-outpainting":
-        if version == "ppt-v1":
-            pos_prefix = "empty scene blur " + prompt
-            neg_prefix = negative_prompt
-        promptA = pos_prefix + " P_ctxt"
-        promptB = pos_prefix + " P_ctxt"
-        negative_promptA = neg_prefix + " P_obj"
-        negative_promptB = neg_prefix + " P_obj"
+        promptA = " P_ctxt"
+        promptB = " P_ctxt"
+        negative_promptA = " P_obj"
+        negative_promptB = " P_obj"
     elif control_type == "shape-guided":
-        if version == "ppt-v1":
-            pos_prefix = prompt
-            neg_prefix = negative_prompt + ", worst quality, low quality, normal quality, bad quality, blurry "
-        promptA = pos_prefix + " P_shape"
-        promptB = pos_prefix + " P_ctxt"
-        negative_promptA = neg_prefix + "P_shape"
-        negative_promptB = neg_prefix + "P_ctxt"
+        promptA = " P_shape"
+        promptB = " P_ctxt"
+        negative_promptA = "P_shape"
+        negative_promptB = "P_ctxt"
     else:
-        if version == "ppt-v1":
-            pos_prefix = prompt
-            neg_prefix = negative_prompt + ", worst quality, low quality, normal quality, bad quality, blurry "
-        promptA = pos_prefix + " P_obj"
-        promptB = pos_prefix + " P_obj"
-        negative_promptA = neg_prefix + "P_obj"
-        negative_promptB = neg_prefix + "P_obj"
+        promptA = " P_obj"
+        promptB = " P_obj"
+        negative_promptA = "P_obj"
+        negative_promptB = "P_obj"
 
     return promptA, promptB, negative_promptA, negative_promptB
+
+
+def compose_inpainted_result(
+    base_image,
+    generated,
+    mask,
+    blur_radius=0,
+    feather_edge_px=0.7,
+    sharpen_radius=1.2,
+    sharpen_percent=100,
+    sharpen_threshold=2,
+    color_match=True,
+    color_match_ring_px=12,
+):
+    """Blend generated pixels into the source image with color/seam cleanup."""
+    generated = generated.convert("RGB").resize(base_image.size, Image.Resampling.LANCZOS)
+    base_image = base_image.convert("RGB")
+    mask_l = mask.convert("L").resize(base_image.size, Image.Resampling.NEAREST)
+    hard_mask = mask_l.point(lambda pixel: 255 if pixel > 127 else 0, mode="L")
+
+    if color_match:
+        ring_px = max(1, int(color_match_ring_px))
+        outer = hard_mask.filter(ImageFilter.MaxFilter(size=ring_px * 2 + 1))
+        mask_np = np.asarray(hard_mask, dtype=np.uint8) > 0
+        ring_np = (np.asarray(outer, dtype=np.uint8) > 0) & (~mask_np)
+        if ring_np.any():
+            base_np = np.asarray(base_image, dtype=np.float32)
+            gen_np = np.asarray(generated, dtype=np.float32)
+            base_mean = base_np[ring_np].mean(axis=0)
+            gen_mean = gen_np[ring_np].mean(axis=0)
+            base_std = base_np[ring_np].std(axis=0) + 1e-6
+            gen_std = gen_np[ring_np].std(axis=0) + 1e-6
+            matched = (gen_np - gen_mean) * (base_std / gen_std) + base_mean
+            generated = Image.fromarray(np.uint8(np.clip(matched, 0, 255)))
+
+    if blur_radius and blur_radius > 0:
+        generated = generated.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    if sharpen_percent and sharpen_percent > 0:
+        generated = generated.filter(
+            ImageFilter.UnsharpMask(
+                radius=sharpen_radius,
+                percent=sharpen_percent,
+                threshold=sharpen_threshold,
+            )
+        )
+
+    if feather_edge_px and feather_edge_px > 0:
+        alpha = hard_mask.filter(ImageFilter.GaussianBlur(radius=feather_edge_px))
+    else:
+        alpha = hard_mask
+
+    alpha_np = (np.asarray(alpha, dtype=np.float32) / 255.0)[..., None]
+    base_np = np.asarray(base_image, dtype=np.float32) / 255.0
+    gen_np = np.asarray(generated, dtype=np.float32) / 255.0
+    out = base_np * (1.0 - alpha_np) + gen_np * alpha_np
+    return Image.fromarray(np.uint8(np.clip(out * 255.0, 0, 255)))
 
 
 def select_tab_text_guided():
@@ -80,166 +141,145 @@ def select_tab_shape_guided():
 
 
 class PowerPaintController:
-    def __init__(self, weight_dtype, checkpoint_dir, local_files_only, version) -> None:
-        self.version = version
+    def __init__(
+        self,
+        weight_dtype,
+        checkpoint_dir,
+        local_files_only,
+        enable_nsfw_filter=True,
+        preserve_original=False,
+        mask_feather_radius=0.7,
+    ) -> None:
         self.checkpoint_dir = checkpoint_dir
         self.local_files_only = local_files_only
+        self.weight_dtype = weight_dtype
+        self.preserve_original = preserve_original
+        self.mask_feather_radius = mask_feather_radius
+        self.translation_model = None
+        self.translation_tokenizer = None
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.nsfw_filter = NSFWImageFilter(device=self.device, weight_dtype=weight_dtype) if enable_nsfw_filter else None
 
-        # initialize powerpaint pipeline
-        if version == "ppt-v1":
-            self.pipe = Pipeline.from_pretrained(
-                "runwayml/stable-diffusion-inpainting", torch_dtype=weight_dtype, local_files_only=local_files_only
-            )
-            self.pipe.tokenizer = TokenizerWrapper(
-                from_pretrained="runwayml/stable-diffusion-v1-5",
-                subfolder="tokenizer",
-                revision=None,
-                local_files_only=local_files_only,
-            )
-
-            # add learned task tokens into the tokenizer
-            add_tokens(
-                tokenizer=self.pipe.tokenizer,
-                text_encoder=self.pipe.text_encoder,
-                placeholder_tokens=["P_ctxt", "P_shape", "P_obj"],
-                initialize_tokens=["a", "a", "a"],
-                num_vectors_per_token=10,
-            )
-
-            # loading pre-trained weights
-            load_model(self.pipe.unet, os.path.join(checkpoint_dir, "unet/unet.safetensors"))
-            load_model(self.pipe.text_encoder, os.path.join(checkpoint_dir, "text_encoder/text_encoder.safetensors"))
-            self.pipe = self.pipe.to("cuda")
-
-            # initialize controlnet-related models
-            self.depth_estimator = DPTForDepthEstimation.from_pretrained("Intel/dpt-hybrid-midas").to("cuda")
-            self.feature_extractor = DPTImageProcessor.from_pretrained("Intel/dpt-hybrid-midas")
-            self.openpose = OpenposeDetector.from_pretrained("lllyasviel/ControlNet")
-            self.hed = HEDdetector.from_pretrained("lllyasviel/ControlNet")
-
-            base_control = ControlNetModel.from_pretrained(
-                "lllyasviel/sd-controlnet-canny", torch_dtype=weight_dtype, local_files_only=local_files_only
-            )
-            self.control_pipe = controlnetPipeline(
-                self.pipe.vae,
-                self.pipe.text_encoder,
-                self.pipe.tokenizer,
-                self.pipe.unet,
-                base_control,
-                self.pipe.scheduler,
-                None,
-                None,
-                False,
-            )
-            self.control_pipe = self.control_pipe.to("cuda")
-
-            self.current_control = "canny"
-            # controlnet_conditioning_scale = 0.8
-        else:
-            # brushnet-based version
-            unet = UNet2DConditionModel.from_pretrained(
-                "runwayml/stable-diffusion-v1-5",
-                subfolder="unet",
-                revision=None,
-                torch_dtype=weight_dtype,
-                local_files_only=local_files_only,
-            )
-            text_encoder_brushnet = CLIPTextModel.from_pretrained(
-                "runwayml/stable-diffusion-v1-5",
-                subfolder="text_encoder",
-                revision=None,
-                torch_dtype=weight_dtype,
-                local_files_only=local_files_only,
-            )
-            brushnet = BrushNetModel.from_unet(unet)
-            base_model_path = os.path.join(checkpoint_dir, "realisticVisionV60B1_v51VAE")
-            self.pipe = StableDiffusionPowerPaintBrushNetPipeline.from_pretrained(
-                base_model_path,
-                brushnet=brushnet,
-                text_encoder_brushnet=text_encoder_brushnet,
-                torch_dtype=weight_dtype,
-                low_cpu_mem_usage=False,
-                safety_checker=None,
-            )
-            self.pipe.unet = UNet2DConditionModel.from_pretrained(
-                base_model_path,
-                subfolder="unet",
-                revision=None,
-                torch_dtype=weight_dtype,
-                local_files_only=local_files_only,
-            )
-            self.pipe.tokenizer = TokenizerWrapper(
-                from_pretrained=base_model_path,
-                subfolder="tokenizer",
-                revision=None,
-                torch_type=weight_dtype,
-                local_files_only=local_files_only,
-            )
-
-            # add learned task tokens into the tokenizer
-            add_tokens(
-                tokenizer=self.pipe.tokenizer,
-                text_encoder=self.pipe.text_encoder_brushnet,
-                placeholder_tokens=["P_ctxt", "P_shape", "P_obj"],
-                initialize_tokens=["a", "a", "a"],
-                num_vectors_per_token=10,
-            )
-            load_model(
-                self.pipe.brushnet,
-                os.path.join(checkpoint_dir, "PowerPaint_Brushnet/diffusion_pytorch_model.safetensors"),
-            )
-
-            self.pipe.text_encoder_brushnet.load_state_dict(
-                torch.load(os.path.join(checkpoint_dir, "PowerPaint_Brushnet/pytorch_model.bin")), strict=False
-            )
-
-            self.pipe.scheduler = UniPCMultistepScheduler.from_config(self.pipe.scheduler.config)
-
-            self.pipe.enable_model_cpu_offload()
-            self.pipe = self.pipe.to("cuda")
-
-    def get_depth_map(self, image):
-        image = self.feature_extractor(images=image, return_tensors="pt").pixel_values.to("cuda")
-        with torch.no_grad(), torch.autocast("cuda"):
-            depth_map = self.depth_estimator(image).predicted_depth
-
-        depth_map = torch.nn.functional.interpolate(
-            depth_map.unsqueeze(1),
-            size=(1024, 1024),
-            mode="bicubic",
-            align_corners=False,
+        # brushnet-based version
+        unet = UNet2DConditionModel.from_pretrained(
+            "runwayml/stable-diffusion-v1-5",
+            subfolder="unet",
+            revision=None,
+            torch_dtype=weight_dtype,
+            local_files_only=local_files_only,
         )
-        depth_min = torch.amin(depth_map, dim=[1, 2, 3], keepdim=True)
-        depth_max = torch.amax(depth_map, dim=[1, 2, 3], keepdim=True)
-        depth_map = (depth_map - depth_min) / (depth_max - depth_min)
-        image = torch.cat([depth_map] * 3, dim=1)
+        text_encoder_brushnet = CLIPTextModel.from_pretrained(
+            "runwayml/stable-diffusion-v1-5",
+            subfolder="text_encoder",
+            revision=None,
+            torch_dtype=weight_dtype,
+            local_files_only=local_files_only,
+        )
+        brushnet = BrushNetModel.from_unet(unet)
+        base_model_path = os.path.join(checkpoint_dir, "realisticVisionV60B1_v51VAE")
+        self.pipe = StableDiffusionPowerPaintBrushNetPipeline.from_pretrained(
+            base_model_path,
+            brushnet=brushnet,
+            text_encoder_brushnet=text_encoder_brushnet,
+            torch_dtype=weight_dtype,
+            low_cpu_mem_usage=False,
+            safety_checker=None,
+        )
+        self.pipe.unet = UNet2DConditionModel.from_pretrained(
+            base_model_path,
+            subfolder="unet",
+            revision=None,
+            torch_dtype=weight_dtype,
+            local_files_only=local_files_only,
+        )
+        self.pipe.tokenizer = TokenizerWrapper(
+            from_pretrained=base_model_path,
+            subfolder="tokenizer",
+            revision=None,
+            torch_type=weight_dtype,
+            local_files_only=local_files_only,
+        )
 
-        image = image.permute(0, 2, 3, 1).cpu().numpy()[0]
-        image = Image.fromarray((image * 255.0).clip(0, 255).astype(np.uint8))
-        return image
+        add_tokens(
+            tokenizer=self.pipe.tokenizer,
+            text_encoder=self.pipe.text_encoder_brushnet,
+            placeholder_tokens=["P_ctxt", "P_shape", "P_obj"],
+            initialize_tokens=["a", "a", "a"],
+            num_vectors_per_token=10,
+        )
+        load_model(
+            self.pipe.brushnet,
+            os.path.join(checkpoint_dir, "PowerPaint_Brushnet/diffusion_pytorch_model.safetensors"),
+        )
 
-    def load_controlnet(self, control_type):
-        if self.current_control != control_type:
-            if control_type == "canny" or control_type is None:
-                self.control_pipe.controlnet = ControlNetModel.from_pretrained(
-                    "lllyasviel/sd-controlnet-canny", torch_dtype=weight_dtype, local_files_only=self.local_files_only
-                )
-            elif control_type == "pose":
-                self.control_pipe.controlnet = ControlNetModel.from_pretrained(
-                    "lllyasviel/sd-controlnet-openpose",
-                    torch_dtype=weight_dtype,
-                    local_files_only=self.local_files_only,
-                )
-            elif control_type == "depth":
-                self.control_pipe.controlnet = ControlNetModel.from_pretrained(
-                    "lllyasviel/sd-controlnet-depth", torch_dtype=weight_dtype, local_files_only=self.local_files_only
-                )
-            else:
-                self.control_pipe.controlnet = ControlNetModel.from_pretrained(
-                    "lllyasviel/sd-controlnet-hed", torch_dtype=weight_dtype, local_files_only=self.local_files_only
-                )
-            self.control_pipe = self.control_pipe.to("cuda")
-            self.current_control = control_type
+        self.pipe.text_encoder_brushnet.load_state_dict(
+            torch.load(os.path.join(checkpoint_dir, "PowerPaint_Brushnet/pytorch_model.bin")), strict=False
+        )
+
+        self.pipe.scheduler = UniPCMultistepScheduler.from_config(self.pipe.scheduler.config)
+
+        self.pipe.enable_model_cpu_offload()
+        # Do not move the whole pipeline to CUDA after enabling CPU offload.
+        # The offload hook moves each component to the GPU only when needed;
+        # calling .to("cuda") here defeats that behavior and can exhaust Colab VRAM.
+
+        self.load_translation_model()
+
+    def load_translation_model(self):
+        """Load the Vietnamese→English translation model up front."""
+        if self.translation_model is not None:
+            return
+        model_name = "facebook/nllb-200-distilled-600M"
+        try:
+            self.translation_tokenizer = AutoTokenizer.from_pretrained(
+                model_name, local_files_only=self.local_files_only
+            )
+            self.translation_tokenizer.src_lang = "vie_Latn"
+            self.translation_tokenizer.tgt_lang = "eng_Latn"
+            model_kwargs = {}
+            if self.weight_dtype == torch.float16 and self.device.type == "cuda":
+                model_kwargs["torch_dtype"] = torch.float16
+            self.translation_model = AutoModelForSeq2SeqLM.from_pretrained(
+                model_name, local_files_only=self.local_files_only, **model_kwargs
+            ).eval()
+            self.translation_model = self.translation_model.to(self.device)
+        except OSError as exc:
+            raise RuntimeError(
+                "Không tải được bộ dịch Việt–Anh. Hãy kết nối Internet một lần để tải "
+                "facebook/nllb-200-distilled-600M, hoặc dùng Prompt tiếng Anh."
+            ) from exc
+
+    def translate_vietnamese_prompt(self, prompt):
+        """Translate Vietnamese with the preloaded NLLB model."""
+        if not prompt or not prompt.strip():
+            return ""
+
+        encoded = self.translation_tokenizer(
+            prompt, return_tensors="pt", padding=True, truncation=True, max_length=256
+        ).to(self.device)
+        with torch.no_grad():
+            translated = self.translation_model.generate(
+                **encoded,
+                max_new_tokens=256,
+                forced_bos_token_id=self.translation_tokenizer.convert_tokens_to_ids("eng_Latn"),
+            )
+        return self.translation_tokenizer.batch_decode(translated, skip_special_tokens=True)[0]
+
+    def resolve_prompt(self, prompt, language="Tự động"):
+        """Resolve a bilingual prompt, including Vietnamese written without accents."""
+        prompt = (prompt or "").strip()
+        if language == "Tiếng Việt":
+            return self.translate_vietnamese_prompt(prompt)
+        if language == "English":
+            return prompt
+        has_vietnamese_diacritic = any(
+            character in "ăâđêôơưĂÂĐÊÔƠƯ" or "\u1ea0" <= character <= "\u1ef9" for character in prompt
+        )
+        words = set(re.findall(r"[a-zA-ZÀ-ỹĐđ]+", prompt.lower()))
+        has_vietnamese_word = bool(words & VIETNAMESE_HINT_WORDS)
+        if has_vietnamese_diacritic or has_vietnamese_word:
+            return self.translate_vietnamese_prompt(prompt)
+        return prompt
 
     def predict(
         self,
@@ -254,7 +294,16 @@ class PowerPaintController:
         vertical_expansion_ratio,
         horizontal_expansion_ratio,
     ):
-        size1, size2 = input_image["image"].convert("RGB").size
+        input_image["image"] = input_image["image"].convert("RGB")
+        if input_image["mask"] is None:
+            raise ValueError("Hãy tải ảnh và tô vùng cần chỉnh sửa trước khi chạy.")
+        input_image["mask"] = input_image["mask"].convert("RGB")
+        if self.nsfw_filter is not None and self.nsfw_filter.check_image(input_image["image"]):
+            raise gr.Error(
+                "Ảnh đầu vào chứa nội dung nhạy cảm (18+) và không được phép. "
+                "Vui lòng thử lại với ảnh khác."
+            )
+        size1, size2 = input_image["image"].size
 
         if task != "image-outpainting":
             if size1 < size2:
@@ -305,178 +354,84 @@ class PowerPaintController:
             input_image["image"] = Image.fromarray(expand_img)
             input_image["mask"] = Image.fromarray(expand_mask)
 
-        if self.version != "ppt-v1":
-            if task == "image-outpainting":
-                prompt = prompt + " empty scene"
-            if task == "object-removal":
-                prompt = prompt + " empty scene blur"
-        promptA, promptB, negative_promptA, negative_promptB = add_task(prompt, negative_prompt, task, self.version)
+        if task == "image-outpainting":
+            prompt = prompt + " empty scene"
+        if task == "object-removal":
+            # Do not ask the diffusion model to blur the filled area.  This
+            # used to make the result preview look like a broken/soft image,
+            # especially when removing text or watermarks.
+            prompt = prompt + " empty scene"
+        promptA, promptB, negative_promptA, negative_promptB = add_task(prompt, negative_prompt, task)
 
         img = np.array(input_image["image"].convert("RGB"))
         W = int(np.shape(img)[0] - np.shape(img)[0] % 8)
         H = int(np.shape(img)[1] - np.shape(img)[1] % 8)
         input_image["image"] = input_image["image"].resize((H, W))
         input_image["mask"] = input_image["mask"].resize((H, W))
+        original_image = input_image["image"].copy()
         set_seed(seed)
 
-        if self.version == "ppt-v1":
-            # for sd-inpainting based method
-            result = self.pipe(
-                promptA=promptA,
-                promptB=promptB,
-                tradoff=fitting_degree,
-                tradoff_nag=fitting_degree,
-                negative_promptA=negative_promptA,
-                negative_promptB=negative_promptB,
-                image=input_image["image"].convert("RGB"),
-                mask=input_image["mask"].convert("RGB"),
-                width=H,
-                height=W,
-                guidance_scale=scale,
-                num_inference_steps=ddim_steps,
-            ).images[0]
-        else:
-            # for brushnet-based method
-            np_inpimg = np.array(input_image["image"])
-            np_inmask = np.array(input_image["mask"]) / 255.0
-            np_inpimg = np_inpimg * (1 - np_inmask)
-            input_image["image"] = Image.fromarray(np_inpimg.astype(np.uint8)).convert("RGB")
-            result = self.pipe(
-                promptA=promptA,
-                promptB=promptB,
-                promptU=prompt,
-                tradoff=fitting_degree,
-                tradoff_nag=fitting_degree,
-                image=input_image["image"].convert("RGB"),
-                mask=input_image["mask"].convert("RGB"),
-                num_inference_steps=ddim_steps,
-                generator=torch.Generator("cuda").manual_seed(seed),
-                brushnet_conditioning_scale=1.0,
-                negative_promptA=negative_promptA,
-                negative_promptB=negative_promptB,
-                negative_promptU=negative_prompt,
-                guidance_scale=scale,
-                width=H,
-                height=W,
-            ).images[0]
-
-        mask_np = np.array(input_image["mask"].convert("RGB"))
-        red = np.array(result).astype("float") * 1
-        red[:, :, 0] = 180.0
-        red[:, :, 2] = 0
-        red[:, :, 1] = 0
-        result_m = np.array(result)
-        result_m = Image.fromarray(
-            (
-                result_m.astype("float") * (1 - mask_np.astype("float") / 512.0)
-                + mask_np.astype("float") / 512.0 * red
-            ).astype("uint8")
-        )
-        m_img = input_image["mask"].convert("RGB").filter(ImageFilter.GaussianBlur(radius=3))
-        m_img = np.asarray(m_img) / 255.0
-        img_np = np.asarray(input_image["image"].convert("RGB")) / 255.0
-        ours_np = np.asarray(result) / 255.0
-        ours_np = ours_np * m_img + (1 - m_img) * img_np
-        dict_res = [input_image["mask"].convert("RGB"), result_m]
-
-        # result_paste = Image.fromarray(np.uint8(ours_np * 255))
-        # dict_out = [input_image["image"].convert("RGB"), result_paste]
-        dict_out = [result]
-        return dict_out, dict_res
-
-    def predict_controlnet(
-        self,
-        input_image,
-        input_control_image,
-        control_type,
-        prompt,
-        ddim_steps,
-        scale,
-        seed,
-        negative_prompt,
-        controlnet_conditioning_scale,
-    ):
-        promptA = prompt + " P_obj"
-        promptB = prompt + " P_obj"
-        negative_promptA = negative_prompt
-        negative_promptB = negative_prompt
-        size1, size2 = input_image["image"].convert("RGB").size
-
-        if size1 < size2:
-            input_image["image"] = input_image["image"].convert("RGB").resize((640, int(size2 / size1 * 640)))
-        else:
-            input_image["image"] = input_image["image"].convert("RGB").resize((int(size1 / size2 * 640), 640))
-        img = np.array(input_image["image"].convert("RGB"))
-        W = int(np.shape(img)[0] - np.shape(img)[0] % 8)
-        H = int(np.shape(img)[1] - np.shape(img)[1] % 8)
-        input_image["image"] = input_image["image"].resize((H, W))
-        input_image["mask"] = input_image["mask"].resize((H, W))
-
-        if control_type != self.current_control:
-            self.load_controlnet(control_type)
-        controlnet_image = input_control_image
-        if control_type == "canny":
-            controlnet_image = controlnet_image.resize((H, W))
-            controlnet_image = np.array(controlnet_image)
-            controlnet_image = cv2.Canny(controlnet_image, 100, 200)
-            controlnet_image = controlnet_image[:, :, None]
-            controlnet_image = np.concatenate([controlnet_image, controlnet_image, controlnet_image], axis=2)
-            controlnet_image = Image.fromarray(controlnet_image)
-        elif control_type == "pose":
-            controlnet_image = self.openpose(controlnet_image)
-        elif control_type == "depth":
-            controlnet_image = controlnet_image.resize((H, W))
-            controlnet_image = self.get_depth_map(controlnet_image)
-        else:
-            controlnet_image = self.hed(controlnet_image)
-
-        mask_np = np.array(input_image["mask"].convert("RGB"))
-        controlnet_image = controlnet_image.resize((H, W))
-        set_seed(seed)
-        result = self.control_pipe(
-            promptA=promptB,
-            promptB=promptA,
-            tradoff=1.0,
-            tradoff_nag=1.0,
+        np_inpimg = np.array(input_image["image"])
+        np_inmask = np.array(input_image["mask"]) / 255.0
+        np_inpimg = np_inpimg * (1 - np_inmask)
+        masked_image = Image.fromarray(np_inpimg.astype(np.uint8)).convert("RGB")
+        result = self.pipe(
+            promptA=promptA,
+            promptB=promptB,
+            promptU=prompt,
+            tradoff=fitting_degree,
+            tradoff_nag=fitting_degree,
+            image=masked_image,
+            mask=input_image["mask"].convert("RGB"),
+            num_inference_steps=ddim_steps,
+            generator=torch.Generator("cuda").manual_seed(seed),
+            brushnet_conditioning_scale=1.0,
             negative_promptA=negative_promptA,
             negative_promptB=negative_promptB,
-            image=input_image["image"].convert("RGB"),
-            mask=input_image["mask"].convert("RGB"),
-            control_image=controlnet_image,
+            negative_promptU=negative_prompt,
+            guidance_scale=scale,
             width=H,
             height=W,
-            guidance_scale=scale,
-            controlnet_conditioning_scale=controlnet_conditioning_scale,
-            num_inference_steps=ddim_steps,
         ).images[0]
-        red = np.array(result).astype("float") * 1
-        red[:, :, 0] = 180.0
-        red[:, :, 2] = 0
-        red[:, :, 1] = 0
-        result_m = np.array(result)
-        result_m = Image.fromarray(
-            (
-                result_m.astype("float") * (1 - mask_np.astype("float") / 512.0)
-                + mask_np.astype("float") / 512.0 * red
-            ).astype("uint8")
-        )
 
+        if self.nsfw_filter is not None and self.nsfw_filter.check_image(result):
+            raise gr.Error(
+                "Kết quả tạo ra chứa nội dung nhạy cảm (18+) và không được phép. "
+                "Vui lòng thử lại với prompt hoặc ảnh khác."
+            )
+
+        if self.preserve_original:
+            final_result = compose_inpainted_result(
+                original_image,
+                result,
+                input_image["mask"],
+                feather_edge_px=self.mask_feather_radius,
+                sharpen_radius=1.2,
+                sharpen_percent=100,
+                sharpen_threshold=2,
+                color_match=True,
+                color_match_ring_px=12,
+            )
+        else:
+            final_result = result
         mask_np = np.array(input_image["mask"].convert("RGB"))
-        m_img = input_image["mask"].convert("RGB").filter(ImageFilter.GaussianBlur(radius=4))
-        m_img = np.asarray(m_img) / 255.0
-        img_np = np.asarray(input_image["image"].convert("RGB")) / 255.0
-        ours_np = np.asarray(result) / 255.0
-        ours_np = ours_np * m_img + (1 - m_img) * img_np
-        result_paste = Image.fromarray(np.uint8(ours_np * 255))
-        return [input_image["image"].convert("RGB"), result_paste], [controlnet_image, result_m]
+        # Gallery previews are resized by the browser.  Return a binary mask
+        # for the mask panel so its edges stay crisp instead of showing the
+        # semi-transparent result overlay as a second, blurry image.
+        display_mask = Image.fromarray(((mask_np[:, :, 0] > 127) * 255).astype("uint8"), mode="L").convert("RGB")
+        dict_res = [display_mask]
+        dict_out = [final_result]
+        return dict_out, dict_res
 
     def infer(
         self,
         input_image,
         text_guided_prompt,
         text_guided_negative_prompt,
+        text_guided_prompt_language,
         shape_guided_prompt,
         shape_guided_negative_prompt,
+        shape_guided_prompt_language,
         fitting_degree,
         ddim_steps,
         scale,
@@ -486,25 +441,42 @@ class PowerPaintController:
         horizontal_expansion_ratio,
         outpaint_prompt,
         outpaint_negative_prompt,
+        outpaint_prompt_language,
         removal_prompt,
         removal_negative_prompt,
-        enable_control=False,
-        input_control_image=None,
-        control_type="canny",
-        controlnet_conditioning_scale=None,
+        removal_prompt_language,
+        enable_shape_guided=True,
     ):
+        # Check the raw (possibly Vietnamese) prompts before translation, so
+        # 18+ wording is caught even if the NLLB translation rephrases it.
+        for raw_prompt in (
+            text_guided_prompt,
+            shape_guided_prompt,
+            outpaint_prompt,
+            removal_prompt,
+            text_guided_negative_prompt,
+            shape_guided_negative_prompt,
+            outpaint_negative_prompt,
+            removal_negative_prompt,
+        ):
+            self._raise_if_blocked_prompt(raw_prompt)
+
         if task == "text-guided":
-            prompt = text_guided_prompt
-            negative_prompt = text_guided_negative_prompt
+            prompt = self.resolve_prompt(text_guided_prompt, text_guided_prompt_language)
+            negative_prompt = self.resolve_prompt(text_guided_negative_prompt, text_guided_prompt_language)
         elif task == "shape-guided":
-            prompt = shape_guided_prompt
-            negative_prompt = shape_guided_negative_prompt
+            prompt = self.resolve_prompt(shape_guided_prompt, shape_guided_prompt_language)
+            negative_prompt = self.resolve_prompt(shape_guided_negative_prompt, shape_guided_prompt_language)
+            if not enable_shape_guided:
+                task = "text-guided"
         elif task == "object-removal":
-            prompt = removal_prompt
-            negative_prompt = removal_negative_prompt
+            prompt = self.resolve_prompt(removal_prompt, removal_prompt_language)
+            negative_prompt = self.resolve_prompt(removal_negative_prompt, removal_prompt_language)
         elif task == "image-outpainting":
-            prompt = outpaint_prompt
-            negative_prompt = outpaint_negative_prompt
+            prompt = self.resolve_prompt(outpaint_prompt, outpaint_prompt_language)
+            negative_prompt = self.resolve_prompt(outpaint_negative_prompt, outpaint_prompt_language)
+            self._raise_if_blocked_prompt(prompt)
+            self._raise_if_blocked_prompt(negative_prompt)
             return self.predict(
                 input_image,
                 prompt,
@@ -519,324 +491,261 @@ class PowerPaintController:
             )
         else:
             task = "text-guided"
-            prompt = text_guided_prompt
-            negative_prompt = text_guided_negative_prompt
+            prompt = self.resolve_prompt(text_guided_prompt, text_guided_prompt_language)
+            negative_prompt = self.resolve_prompt(text_guided_negative_prompt, text_guided_prompt_language)
 
-        # currently, we only support controlnet in PowerPaint-v1
-        if self.version == "ppt-v1" and enable_control and task == "text-guided":
-            return self.predict_controlnet(
-                input_image,
-                input_control_image,
-                control_type,
-                prompt,
-                ddim_steps,
-                scale,
-                seed,
-                negative_prompt,
-                controlnet_conditioning_scale,
+        self._raise_if_blocked_prompt(prompt)
+        self._raise_if_blocked_prompt(negative_prompt)
+        return self.predict(
+            input_image, prompt, fitting_degree, ddim_steps, scale, seed, negative_prompt, task, None, None
+        )
+
+    def _raise_if_blocked_prompt(self, prompt):
+        """Raise a user-visible error when the resolved prompt is 18+."""
+        if self.nsfw_filter is None:
+            return
+        if prompt_is_blocked(prompt):
+            raise gr.Error(
+                "Prompt chứa nội dung nhạy cảm (18+) và không được phép. "
+                "Vui lòng thử lại với mô tả khác."
             )
-        else:
-            return self.predict(
-                input_image, prompt, fitting_degree, ddim_steps, scale, seed, negative_prompt, task, None, None
-            )
-
-
-def run_inference_with_history(
-    controller,
-    input_image,
-    text_guided_prompt,
-    text_guided_negative_prompt,
-    shape_guided_prompt,
-    shape_guided_negative_prompt,
-    fitting_degree,
-    ddim_steps,
-    scale,
-    seed,
-    task,
-    vertical_expansion_ratio,
-    horizontal_expansion_ratio,
-    outpaint_prompt,
-    outpaint_negative_prompt,
-    removal_prompt,
-    removal_negative_prompt,
-    auto_translate_prompts,
-    activity_history,
-    enable_control=False,
-    input_control_image=None,
-    control_type="canny",
-    controlnet_conditioning_scale=None,
-):
-    normalized_input = normalize_editor_value(input_image)
-    if normalized_input is None:
-        raise gr.Error("Hay tai anh len va ve mask truoc khi chay.")
-
-    prompt_bundle = {
-        "text_guided_prompt": text_guided_prompt,
-        "text_guided_negative_prompt": text_guided_negative_prompt,
-        "shape_guided_prompt": shape_guided_prompt,
-        "shape_guided_negative_prompt": shape_guided_negative_prompt,
-        "outpaint_prompt": outpaint_prompt,
-        "outpaint_negative_prompt": outpaint_negative_prompt,
-        "removal_prompt": removal_prompt,
-        "removal_negative_prompt": removal_negative_prompt,
-    }
-    translated_bundle = controller.translate_prompt_bundle(prompt_bundle, auto_translate_prompts)
-    original_prompt, original_negative_prompt, resolved_task = controller.get_active_prompt_pair(task, prompt_bundle)
-    translated_prompt, translated_negative_prompt, _ = controller.get_active_prompt_pair(resolved_task, translated_bundle)
-
-    inference_outputs = controller.infer(
-        normalized_input,
-        translated_bundle["text_guided_prompt"],
-        translated_bundle["text_guided_negative_prompt"],
-        translated_bundle["shape_guided_prompt"],
-        translated_bundle["shape_guided_negative_prompt"],
-        fitting_degree,
-        ddim_steps,
-        scale,
-        seed,
-        resolved_task,
-        vertical_expansion_ratio,
-        horizontal_expansion_ratio,
-        translated_bundle["outpaint_prompt"],
-        translated_bundle["outpaint_negative_prompt"],
-        translated_bundle["removal_prompt"],
-        translated_bundle["removal_negative_prompt"],
-        enable_control,
-        input_control_image,
-        control_type,
-        controlnet_conditioning_scale,
-    )
-
-    activity_message = f"Run {resolved_task}: `{original_prompt or '(trong)'}` -> `{translated_prompt or '(trong)'}`"
-    if controller.translation_error and auto_translate_prompts:
-        activity_message += " (fallback sang prompt goc vi model dich khong san sang)"
-
-    updated_activity = append_activity(activity_history, activity_message)
-    translation_status = render_translation_status(
-        original_prompt,
-        translated_prompt,
-        original_negative_prompt,
-        translated_negative_prompt,
-    )
-    if controller.translation_error and auto_translate_prompts:
-        translation_status += f"\nTranslator fallback: `{controller.translation_error}`"
-
-    return (
-        inference_outputs[0],
-        inference_outputs[1],
-        translation_status,
-        render_activity_history(updated_activity),
-        updated_activity,
-    )
 
 
 if __name__ == "__main__":
     args = argparse.ArgumentParser()
     args.add_argument("--weight_dtype", type=str, default="float16")
-    args.add_argument("--checkpoint_dir", type=str, default="./checkpoints/ppt-v1")
-    args.add_argument("--version", type=str, default="ppt-v1")
+    args.add_argument("--checkpoint_dir", type=str, default="./checkpoints/ppt-v2")
     args.add_argument("--share", action="store_true")
     args.add_argument("--ngrok", action="store_true")
     args.add_argument("--ngrok_token", type=str, default="")
     args.add_argument(
         "--local_files_only", action="store_true", help="enable it to use cached files without requesting from the hub"
     )
+    args.add_argument(
+        "--no-nsfw-filter",
+        action="store_true",
+        help="disable the 18+ filter (prompt keywords and image classifier)",
+    )
+    args.add_argument(
+        "--preserve-original",
+        action="store_true",
+        help="keep the source image outside the mask and use model output only inside the mask",
+    )
+    args.add_argument(
+        "--mask-feather-radius",
+        type=float,
+        default=0.7,
+        help="soften the mask edge when compositing (0 disables feathering)",
+    )
     args.add_argument("--port", type=int, default=7860)
     args = args.parse_args()
 
     # initialize the pipeline controller
     weight_dtype = torch.float16 if args.weight_dtype == "float16" else torch.float32
-    controller = PowerPaintController(weight_dtype, args.checkpoint_dir, args.local_files_only, args.version)
+    controller = PowerPaintController(
+        weight_dtype,
+        args.checkpoint_dir,
+        args.local_files_only,
+        enable_nsfw_filter=not args.no_nsfw_filter,
+        preserve_original=args.preserve_original,
+        mask_feather_radius=args.mask_feather_radius,
+    )
+
+    css_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "style.css")
+    with open(css_path, encoding="utf-8") as css_file:
+        custom_css = css_file.read()
+    prompt_guide_html = (
+        "<div class='inline-prompt-guide'><b>Prompt guide:</b> <b>Positive Prompt</b> mô tả điều muốn tạo; "
+        "<b>Negative Prompt</b> mô tả điều cần tránh (ví dụ: mờ, chữ, watermark). "
+        "Chọn <b>Tiếng Việt</b> nếu bạn nhập tiếng Việt có hoặc không dấu.</div>"
+    )
 
     # ui
-    with gr.Blocks(css="style.css") as demo:
-        with gr.Row():
-            gr.Markdown(
-                "<div align='center'><font size='18'>PowerPaint: High-Quality Versatile Image Inpainting</font></div>"  # noqa
-            )
-        with gr.Row():
-            gr.Markdown(
-                "<div align='center'><font size='5'><a href='https://powerpaint.github.io/'>Project Page</a> &ensp;"  # noqa
-                "<a href='https://arxiv.org/abs/2312.03594/'>Paper</a> &ensp;"
-                "<a href='https://github.com/open-mmlab/powerpaint'>Code</a> </font></div>"  # noqa
-            )
-        with gr.Row():
-            gr.Markdown(
-                "**Note:** Due to network-related factors, the page may experience occasional bugs！ If the inpainting results deviate significantly from expectations, consider toggling between task options to refresh the content."  # noqa
-            )
-        # Attention: Due to network-related factors, the page may experience occasional bugs. If the inpainting results deviate significantly from expectations, consider toggling between task options to refresh the content.
-        with gr.Row():
-            with gr.Column():
-                gr.Markdown("### Input image and draw mask")
-                input_image = gr.Image(source="upload", tool="sketch", type="pil")
+    with gr.Blocks(css=custom_css, title="PowerPaint") as demo:
+        gr.HTML(
+            "<header class='app-header'><h1>PowerPaint</h1></header>"
+        )
+        gr.HTML(
+            "<div class='notice'><b>Lưu ý:</b> Nếu kết quả chưa như mong muốn, hãy thử đổi tác vụ "
+            "hoặc điều chỉnh prompt và Guidance Scale.</div>"
+        )
+        with gr.Row(equal_height=False, elem_classes=["workspace"]):
+            with gr.Column(scale=1, elem_classes=["left-panel"]):
+                gr.HTML("<div class='section-title'>Ảnh đầu vào</div>", elem_classes=["section-title-wrap"])
+                with gr.Group(elem_classes=["panel-card", "input-card"]):
+                    input_image = gr.Image(
+                        source="upload",
+                        tool="sketch",
+                        type="pil",
+                        show_label=False,
+                        height=360,
+                        brush_radius=None,
+                        elem_id="input-image",
+                    )
 
                 task = gr.Radio(
                     ["text-guided", "object-removal", "shape-guided", "image-outpainting"],
+                    value="shape-guided",
                     show_label=False,
                     visible=False,
                 )
 
-                # Text-guided object inpainting
-                with gr.Tab("Text-guided object inpainting") as tab_text_guided:
-                    enable_text_guided = gr.Checkbox(
-                        label="Enable text-guided object inpainting", value=True, interactive=False
-                    )
-                    text_guided_prompt = gr.Textbox(label="Prompt")
-                    text_guided_negative_prompt = gr.Textbox(label="negative_prompt")
+                with gr.Tabs(elem_id="task-tabs"):
+                    with gr.Tab("Shape-guided") as tab_shape_guided:
+                        with gr.Group(elem_classes=["task-card"]):
+                            enable_shape_guided = gr.Checkbox(
+                                label="Bật Shape Guided Inpainting", value=True, interactive=True
+                            )
+                            shape_guided_prompt = gr.Textbox(
+                                label="Positive Prompt",
+                                placeholder="Ví dụ: một chú mèo trắng / a white cat",
+                            )
+                            shape_guided_negative_prompt = gr.Textbox(
+                                label="Negative Prompt",
+                                placeholder="Ví dụ: mờ, chữ, watermark / blurry, text, watermark",
+                            )
+                            gr.HTML(prompt_guide_html)
+                            shape_guided_prompt_language = gr.Dropdown(
+                                ["Tự động", "Tiếng Việt", "English"],
+                                label="Ngôn ngữ prompt (áp dụng cho cả 2 ô)",
+                                value="Tự động",
+                            )
+                            fitting_degree = gr.Slider(
+                                label="Blending Degree (độ khớp mask)", minimum=0, maximum=1, step=0.05, value=1
+                            )
+                    tab_shape_guided.select(fn=select_tab_shape_guided, inputs=None, outputs=task)
+
+                    with gr.Tab("Removal") as tab_object_removal:
+                        with gr.Group(elem_classes=["task-card", "removal-card"]):
+                            gr.Markdown(
+                                "#### Xoá đối tượng\n"
+                                "Tô mask lên vật thể cần xoá. Prompt mô tả phần nền sẽ được lấp vào."
+                            )
+                            removal_prompt = gr.Textbox(
+                                label="Positive Prompt",
+                                placeholder="Ví dụ: bãi biển vắng người / empty beach",
+                            )
+                            removal_negative_prompt = gr.Textbox(
+                                label="Negative Prompt",
+                                placeholder="Ví dụ: mờ, chữ / blurry, text",
+                            )
+                            gr.HTML(prompt_guide_html)
+                            removal_prompt_language = gr.Dropdown(
+                                ["Tự động", "Tiếng Việt", "English"],
+                                label="Ngôn ngữ prompt (áp dụng cho cả 2 ô)",
+                                value="Tự động",
+                            )
+
+                    with gr.Tab("Outpainting") as tab_image_outpainting:
+                        with gr.Group(elem_classes=["task-card"]):
+                            outpaint_prompt = gr.Textbox(
+                                label="Positive Prompt",
+                                placeholder="Ví dụ: bãi biển lúc hoàng hôn / beach at sunset",
+                            )
+                            outpaint_negative_prompt = gr.Textbox(
+                                label="Negative Prompt",
+                                placeholder="Ví dụ: mờ, chữ / blurry, text",
+                            )
+                            gr.HTML(prompt_guide_html)
+                            outpaint_prompt_language = gr.Dropdown(
+                                ["Tự động", "Tiếng Việt", "English"],
+                                label="Ngôn ngữ prompt (áp dụng cho cả 2 ô)",
+                                value="Tự động",
+                            )
+                            with gr.Row():
+                                horizontal_expansion_ratio = gr.Slider(
+                                    label="Mở rộng ngang", minimum=1, maximum=4, step=0.05, value=1
+                                )
+                                vertical_expansion_ratio = gr.Slider(
+                                    label="Mở rộng dọc", minimum=1, maximum=4, step=0.05, value=1
+                                )
+                    tab_image_outpainting.select(fn=select_tab_image_outpainting, inputs=None, outputs=task)
+
+                    with gr.Tab("Text-guided") as tab_text_guided:
+                        with gr.Group(elem_classes=["task-card"]):
+                            text_guided_prompt = gr.Textbox(
+                                label="Positive Prompt",
+                                placeholder="Ví dụ: một chiếc xe đạp đỏ / a red bicycle",
+                            )
+                            text_guided_negative_prompt = gr.Textbox(
+                                label="Negative Prompt",
+                                placeholder="Ví dụ: mờ, méo hình / blurry, distorted",
+                            )
+                            gr.HTML(prompt_guide_html)
+                            text_guided_prompt_language = gr.Dropdown(
+                                ["Tự động", "Tiếng Việt", "English"],
+                                label="Ngôn ngữ prompt (áp dụng cho cả 2 ô)",
+                                value="Tự động",
+                            )
                     tab_text_guided.select(fn=select_tab_text_guided, inputs=None, outputs=task)
 
-                    # currently, we only support controlnet in PowerPaint-v1
-                    if args.version == "ppt-v1":
-                        gr.Markdown("### Controlnet setting")
-                        enable_control = gr.Checkbox(
-                            label="Enable controlnet", info="Enable this if you want to use controlnet"
-                        )
-                        controlnet_conditioning_scale = gr.Slider(
-                            label="controlnet conditioning scale",
-                            minimum=0,
-                            maximum=1,
-                            step=0.05,
-                            value=0.5,
-                        )
-                        control_type = gr.Radio(["canny", "pose", "depth", "hed"], label="Control type")
-                        input_control_image = gr.Image(source="upload", type="pil")
-
-                # Object removal inpainting
-                with gr.Tab("Object removal inpainting") as tab_object_removal:
-                    enable_object_removal = gr.Checkbox(
-                        label="Enable object removal inpainting",
-                        value=True,
-                        info="The recommended configuration for the Guidance Scale is 10 or higher. \
-                        If undesired objects appear in the masked area, \
-                        you can address this by specifically increasing the Guidance Scale.",
-                        interactive=False,
-                    )
-                    removal_prompt = gr.Textbox(label="Prompt")
-                    removal_negative_prompt = gr.Textbox(label="negative_prompt")
-                tab_object_removal.select(fn=select_tab_object_removal, inputs=None, outputs=task)
-
-                # Object image outpainting
-                with gr.Tab("Image outpainting") as tab_image_outpainting:
-                    enable_object_removal = gr.Checkbox(
-                        label="Enable image outpainting",
-                        value=True,
-                        info="The recommended configuration for the Guidance Scale is 10 or higher. \
-                        If unwanted random objects appear in the extended image region, \
-                            you can enhance the cleanliness of the extension area by increasing the Guidance Scale.",
-                        interactive=False,
-                    )
-                    outpaint_prompt = gr.Textbox(label="Outpainting_prompt")
-                    outpaint_negative_prompt = gr.Textbox(label="Outpainting_negative_prompt")
-                    horizontal_expansion_ratio = gr.Slider(
-                        label="horizontal expansion ratio",
-                        minimum=1,
-                        maximum=4,
-                        step=0.05,
-                        value=1,
-                    )
-                    vertical_expansion_ratio = gr.Slider(
-                        label="vertical expansion ratio",
-                        minimum=1,
-                        maximum=4,
-                        step=0.05,
-                        value=1,
-                    )
-                tab_image_outpainting.select(fn=select_tab_image_outpainting, inputs=None, outputs=task)
-
-                # Shape-guided object inpainting
-                with gr.Tab("Shape-guided object inpainting") as tab_shape_guided:
-                    enable_shape_guided = gr.Checkbox(
-                        label="Enable shape-guided object inpainting", value=True, interactive=False
-                    )
-                    shape_guided_prompt = gr.Textbox(label="shape_guided_prompt")
-                    shape_guided_negative_prompt = gr.Textbox(label="shape_guided_negative_prompt")
-                    fitting_degree = gr.Slider(
-                        label="fitting degree",
-                        minimum=0,
-                        maximum=1,
-                        step=0.05,
-                        value=1,
-                    )
-                tab_shape_guided.select(fn=select_tab_shape_guided, inputs=None, outputs=task)
-
-                run_button = gr.Button(label="Run")
-                with gr.Accordion("Advanced options", open=False):
-                    ddim_steps = gr.Slider(label="Steps", minimum=1, maximum=50, value=45, step=1)
+                run_button = gr.Button("Chạy Inpainting", elem_id="run-button")
+                with gr.Accordion("Tuỳ chọn nâng cao", open=False, elem_classes=["advanced-card"]):
+                    ddim_steps = gr.Slider(label="Steps (số bước)", minimum=1, maximum=50, value=45, step=1)
                     scale = gr.Slider(
-                        label="Guidance Scale",
-                        info="For object removal and image outpainting, it is recommended to set the value at 10 or above.",
-                        minimum=0.1,
-                        maximum=30.0,
-                        value=7.5,
-                        step=0.1,
+                        label="Guidance Scale (độ bám prompt)", minimum=0.1, maximum=30.0, value=7.5, step=0.1,
+                        elem_id="guidance-scale",
                     )
-                    seed = gr.Slider(
-                        label="Seed",
-                        minimum=0,
-                        maximum=2147483647,
-                        step=1,
-                        randomize=True,
-                    )
-            with gr.Column():
-                gr.Markdown("### Inpainting result")
-                inpaint_result = gr.Gallery(label="Generated images", show_label=False, columns=2)
-                gr.Markdown("### Mask")
-                gallery = gr.Gallery(label="Generated masks", show_label=False, columns=2)
+                    seed = gr.Slider(label="Seed (hạt giống)", minimum=0, maximum=2147483647, step=1, randomize=True)
 
-        if args.version == "ppt-v1":
-            run_button.click(
-                fn=run_app_inference,
-                inputs=[
-                    input_image,
-                    text_guided_prompt,
-                    text_guided_negative_prompt,
-                    shape_guided_prompt,
-                    shape_guided_negative_prompt,
-                    fitting_degree,
-                    ddim_steps,
-                    scale,
-                    seed,
-                    task,
-                    vertical_expansion_ratio,
-                    horizontal_expansion_ratio,
-                    outpaint_prompt,
-                    outpaint_negative_prompt,
-                    removal_prompt,
-                    removal_negative_prompt,
-                    auto_translate_prompts,
-                    activity_history_state,
-                    enable_control,
-                    input_control_image,
-                    control_type,
-                    controlnet_conditioning_scale,
-                ],
-                outputs=[inpaint_result, gallery, translation_status, history_markdown, activity_history_state],
-            )
-        else:
-            run_button.click(
-                fn=run_app_inference,
-                inputs=[
-                    input_image,
-                    text_guided_prompt,
-                    text_guided_negative_prompt,
-                    shape_guided_prompt,
-                    shape_guided_negative_prompt,
-                    fitting_degree,
-                    ddim_steps,
-                    scale,
-                    seed,
-                    task,
-                    vertical_expansion_ratio,
-                    horizontal_expansion_ratio,
-                    outpaint_prompt,
-                    outpaint_negative_prompt,
-                    removal_prompt,
-                    removal_negative_prompt,
-                    auto_translate_prompts,
-                    activity_history_state,
-                ],
-                outputs=[inpaint_result, gallery, translation_status, history_markdown, activity_history_state],
-            )
+            with gr.Column(scale=1, elem_classes=["right-panel"]):
+                gr.HTML("<div class='section-title'>Kết quả Inpainting</div>", elem_classes=["section-title-wrap"])
+                with gr.Group(elem_classes=["panel-card", "output-card"]):
+                    inpaint_result = gr.Gallery(
+                        label="Generated images", show_label=False, columns=1, object_fit="contain",
+                        elem_id="result-gallery"
+                    )
+                gr.HTML(
+                    "<div class='section-title mask-section-title'>Mask (vùng chỉnh sửa)</div>",
+                    elem_classes=["section-title-wrap"],
+                )
+                with gr.Group(elem_classes=["panel-card", "mask-card"]):
+                    gallery = gr.Gallery(
+                        label="Generated masks", show_label=False, columns=1, object_fit="contain", elem_id="mask-gallery"
+                    )
+
+        tab_object_removal.select(
+            fn=select_tab_object_removal,
+            inputs=None,
+            outputs=task,
+            _js="""() => {
+                document.querySelectorAll('#guidance-scale input').forEach((input) => {
+                    input.value = 7.5;
+                    input.dispatchEvent(new Event('input', { bubbles: true }));
+                    input.dispatchEvent(new Event('change', { bubbles: true }));
+                });
+                return [];
+            }""",
+        )
+        gr.HTML("<div class='tip'>Mẹo: Tô mask chính xác quanh vùng cần chỉnh để có kết quả tốt hơn.</div>")
+
+        run_button.click(
+            fn=controller.infer,
+            inputs=[
+                input_image,
+                text_guided_prompt,
+                text_guided_negative_prompt,
+                text_guided_prompt_language,
+                shape_guided_prompt,
+                shape_guided_negative_prompt,
+                shape_guided_prompt_language,
+                fitting_degree,
+                ddim_steps,
+                scale,
+                seed,
+                task,
+                vertical_expansion_ratio,
+                horizontal_expansion_ratio,
+                outpaint_prompt,
+                outpaint_negative_prompt,
+                outpaint_prompt_language,
+                removal_prompt,
+                removal_negative_prompt,
+                removal_prompt_language,
+                enable_shape_guided,
+            ],
+            outputs=[inpaint_result, gallery],
+        )
 
     demo.queue()
     if args.ngrok:
@@ -856,4 +765,4 @@ if __name__ == "__main__":
         print("Ngrok URL:")
         print(tunnel.public_url)
         print("=" * 60)
-    demo.launch(share=args.share,server_name="0.0.0.0",server_port=args.port)
+    demo.launch(share=args.share, server_name="0.0.0.0", server_port=args.port)
